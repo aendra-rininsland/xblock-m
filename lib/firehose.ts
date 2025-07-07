@@ -33,7 +33,11 @@ class Batch {
     this.items.push(item);
     if (this.items.length >= this.max) {
       queue
-        .add(new Date().toISOString(), [...this.items], { lifo: false })
+        .add(new Date().toISOString(), [...this.items], {
+          lifo: true,
+          removeOnComplete: true,
+          removeOnFail: true,
+        })
         .catch((e) => console.error(e));
       log(this.items);
       this.items = [];

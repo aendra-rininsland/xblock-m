@@ -36,9 +36,12 @@ async def create_label(result):
         for image in result["image_results"]:
             for label, score in image["labels"].items():
                 if float(score) >= THRESHOLD:
-                    if label == "news" and float(score) >= 0.92:
-                        add_labels.append("newsmedia-screenshot")
-                        blob_cids.append(image["blob_cid"])
+                    # if label == "news" and float(score) >= 0.98:
+                    if label == "news" or label == 'newsmedia':
+                        pass
+
+                        # add_labels.append("newsmedia-screenshot")
+                        # blob_cids.append(image["blob_cid"])
                     elif label != "negative":
                         add_labels.append(f"{label}-screenshot")
                         blob_cids.append(image["blob_cid"])
