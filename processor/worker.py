@@ -1,286 +1,257 @@
 #!/usr/bin/env python
-import os
 import asyncio
 from asyncio import Queue
-import time
-import torch
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-from PIL import Image
-from io import BytesIO
-import torchvision.transforms as T
 import json
-from timm import create_model
-from safetensors.torch import load_file
-from huggingface_hub import hf_hub_download
-from bullmq import Worker
-import asyncio
-import signal
-from moderate import create_label, auth_client
+import logging
 import os
-from constants import THRESHOLD
-from dotenv import load_dotenv
+import signal
+import time
 
-load_dotenv()  # take environment variables from .env.
 
-# Asynchronous HTTP client
 import aiohttp
+import torch
+import torchvision.transforms as T
+from bullmq import Worker
+from dotenv import load_dotenv
+from huggingface_hub import hf_hub_download
+from io import BytesIO
+from PIL import Image
+from safetensors.torch import load_file
+from timm import create_model
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-# Set the number of threads to 1
+from constants import THRESHOLD
+from moderate import auth_client, create_label
+
+load_dotenv()
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+METRICS_FILE = os.path.join(LOG_DIR, "metrics.jsonl")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("xblock")
+
+
+def log_metric(images: int, labels_applied: int, duration: float) -> None:
+    entry = json.dumps({
+        "ts": time.time(),
+        "images": images,
+        "labels_applied": labels_applied,
+        "duration": duration,
+    })
+    with open(METRICS_FILE, "a") as f:
+        f.write(entry + "\n")
+
+
+# ── Model loading ─────────────────────────────────────────────────────────────
+
 torch.set_num_threads(1)
 
-# Use environment variables
 NUM_WORKERS = 50
+NUM_MODEL_INSTANCES = 1
 MODEL_NAME = os.getenv("MODEL_NAME", "swin_s3_base_224-xblockm-timm")
-MODEL_PATH = os.getenv("MODEL_PATH", "./model")
 
-# Check if CUDA (GPU) is available; if not, default to CPU
-device = 0 if torch.cuda.is_available() else -1
-torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info("Using device: %s", device)
 
-# Define model details
 model_id = f"howdyaendra/{MODEL_NAME}"
 cache_dir = "./models"
-# Download model files
-model_weights_path = hf_hub_download(
-    repo_id=model_id, filename="model.safetensors", cache_dir=cache_dir
-)
-config_path = hf_hub_download(
-    repo_id=model_id, filename="config.json", cache_dir=cache_dir
-)
-# Load configuration
+
+model_weights_path = hf_hub_download(repo_id=model_id, filename="model.safetensors", cache_dir=cache_dir)
+config_path = hf_hub_download(repo_id=model_id, filename="config.json", cache_dir=cache_dir)
+
 with open(config_path) as f:
     config = json.load(f)
-print(config)
-num_classes = config.get("num_classes", 13)
-# Create the model and load weights
-model_name = "swin_s3_base_224"
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
-print(device)
+num_classes = config.get("num_classes", 13)
+model_name = "swin_s3_base_224"
+
+img_size = (224, 224)
+transform = T.Compose([
+    T.Resize(img_size),
+    T.CenterCrop(img_size),
+    T.ToTensor(),
+    T.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+])
 
 
 def create_model_instance():
     model = create_model(model_name, num_classes=num_classes, pretrained=False)
     model.to(device)
-    # Load weights
     state_dict = load_file(model_weights_path)
     model.load_state_dict(state_dict)
     model.eval()
     return model
 
 
-def create_text_model_instance():
-    return {
-        "tokenizer": AutoTokenizer.from_pretrained("KoalaAI/Text-Moderation"),
-        "model": AutoModelForSequenceClassification.from_pretrained(
-            "KoalaAI/Text-Moderation"
-        ).to("cuda"),
-    }
-
-
-print("creating event queues")
-model_pool = Queue()
-for _ in range(int(NUM_WORKERS / 5)):
+logger.info("Loading %d model instances...", NUM_MODEL_INSTANCES)
+model_pool: Queue = Queue()
+for _ in range(NUM_MODEL_INSTANCES):
     model_pool.put_nowait(create_model_instance())
-
-# embedder_pool = Queue()
-# for _ in range(int(NUM_WORKERS / 5)):
-#     embedder_pool.put_nowait(create_text_model_instance())
-
-print("model instances loaded")
-# Image transformations
-img_size = (224, 224)
-transform = T.Compose(
-    [
-        T.Resize(img_size),
-        T.CenterCrop(img_size),
-        T.ToTensor(),
-        T.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-    ]
-)
-
-LABEL_MAP = {
-    "S": "sexual",
-    "H": "hate",
-    "V": "violence",
-    "HR": "harassment",
-    "SH": "self-harm",
-    "S3": "sexual/minors",
-    "H2": "hate/threatening",
-    "V2": "violence/graphic",
-    "OK": "OK",
-}
+logger.info("Model instances ready.")
 
 
-# def get_text_labels(text, model, tokenizer):
-#     inputs = tokenizer(text, return_tensors="pt").to("cuda")
-#     outputs = model(**inputs)
-#     logits = outputs.logits
-#     # Apply softmax to get probabilities (scores)
-#     probabilities = logits.softmax(dim=-1).squeeze().tolist()
-#     # Retrieve the labels
-#     id2label = model.config.id2label
-#     labels = [id2label[idx] for idx in range(len(probabilities))]
-#     # Combine labels and probabilities, then sort
-#     return dict(zip([LABEL_MAP[e] for e in labels], probabilities))
+# ── HTTP session ──────────────────────────────────────────────────────────────
+# One shared session for the lifetime of the process, created lazily once the
+# event loop is running.
+
+_http_session: aiohttp.ClientSession | None = None
+_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20, connect=5)
 
 
-async def process_single_image(
-    image_url, model, transform, device, config, cid, top_k=10
-):
-    """
-    Process a single image URL to get top-k predictions.
-    """
+def get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        # Keep the connection pool tight — we don't need more open sockets than
+        # the BullMQ concurrency level, and a large pool causes network pressure
+        # that competes with other apps on the machine.
+        connector = aiohttp.TCPConnector(limit=NUM_WORKERS, ttl_dns_cache=300)
+        _http_session = aiohttp.ClientSession(timeout=_HTTP_TIMEOUT, connector=connector)
+    return _http_session
+
+
+# ── Image processing ──────────────────────────────────────────────────────────
+
+_IMAGE_RETRIES = 3
+_IMAGE_RETRY_BASE = 1.0  # seconds
+
+
+async def fetch_image_bytes(url: str) -> bytes | None:
+    """Download with retries and exponential backoff. Returns None on permanent failure."""
+    session = get_http_session()
+    for attempt in range(_IMAGE_RETRIES):
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+                if resp.status < 500:
+                    # 4xx — not a transient error, don't retry
+                    logger.warning("Image fetch %s returned HTTP %d", url, resp.status)
+                    return None
+                raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if attempt == _IMAGE_RETRIES - 1:
+                logger.error("Image fetch %s failed after %d attempts: %s", url, _IMAGE_RETRIES, e)
+                return None
+            wait = _IMAGE_RETRY_BASE * (2 ** attempt)
+            logger.warning("Image fetch %s attempt %d failed (%s), retrying in %.1fs...", url, attempt + 1, e, wait)
+            await asyncio.sleep(wait)
+    return None
+
+
+async def process_single_image(image_url: str, model, cid: str, top_k: int = 10) -> dict:
     start_time = time.time()
-    try:
-        # Download image asynchronously
-        async with aiohttp.ClientSession() as session:
-            async with session.get(image_url) as response:
-                if response.status != 200:
-                    return {
-                        "error": f"Failed to download image. HTTP Status: {response.status}",
-                        "url": image_url,
-                    }
-                content = await response.read()
+    content = await fetch_image_bytes(image_url)
+    if content is None:
+        return {"error": "download failed", "url": image_url, "blob_cid": cid, "labels": {}}
 
-        # Open and process the image
+    try:
         image = Image.open(BytesIO(content)).convert("RGB")
         cuda_image = transform(image).unsqueeze(0).to(device)
         with torch.no_grad():
             logits = model(cuda_image)
         probabilities = [float(e) for e in logits.sigmoid().cpu().numpy()[0]]
-        label_prob_pairs = list(zip(config["label_names"], probabilities))
-        label_prob_pairs.sort(key=lambda x: x[1], reverse=True)
-        top_k_predictions = label_prob_pairs[:top_k]
+        label_prob_pairs = sorted(zip(config["label_names"], probabilities), key=lambda x: x[1], reverse=True)
         return {
             "image_url": image_url,
             "blob_cid": cid,
-            "labels": {label: prob for label, prob in top_k_predictions},
+            "labels": dict(label_prob_pairs[:top_k]),
             "time": time.time() - start_time,
         }
     except Exception as e:
-        return {"error": str(e), "url": image_url}
+        logger.error("Image inference failed for %s: %s", image_url, e)
+        return {"error": str(e), "url": image_url, "blob_cid": cid, "labels": {}}
 
 
-i = 0
-
+# ── Job processing ────────────────────────────────────────────────────────────
 
 async def process_request(job, token):
-    """
-    Asynchronous handler function to process incoming requests.
-    Accepts either a single dictionary or a list of dictionaries as input.
-    """
+    start_time = time.time()
+    input_data = job.data
+    if isinstance(input_data, dict):
+        input_data = [input_data]
+
+    model = await model_pool.get()
     try:
-        start_time = time.time()
-
-        input_data = job.data
-
-        # If input_data is a single dict, convert it to a list for unified processing
-        if isinstance(input_data, dict):
-            input_data = [input_data]
         results = []
-
-        # Acquire models for the entire batch
-        # embedder = await embedder_pool.get()
-        model = await model_pool.get()
-
-        try:
-            # Process each item in the input list
-            for data in input_data:
-                image_urls = []
-                # print(data.get("record", {}).get("embed", {}).get("images", []))
-                # print(data)
-                images = (
-                    data.get("commit", {})
+        for data in input_data:
+            images = (
+                data.get("commit", {})
                     .get("record", {})
                     .get("embed", {})
                     .get("images", [])
+            )
+            image_urls = [
+                (
+                    f"https://cdn.bsky.app/img/feed_thumbnail/plain/{data['did']}/{img['image']['ref']['$link']}@jpeg",
+                    img["image"]["ref"]["$link"],
                 )
+                for img in images
+            ]
 
-                for img in images:
-                    image_urls.append(
-                        [
-                            f"https://cdn.bsky.app/img/feed_thumbnail/plain/{data['did']}/{img['image']['ref']['$link']}@jpeg",
-                            img["image"]["ref"]["$link"],
-                        ]
-                    )
+            image_results = []
+            if image_urls:
+                tasks = [process_single_image(url, model, cid) for url, cid in image_urls]
+                image_results = await asyncio.gather(*tasks)
 
-                image_results = {}
+            results.append({
+                "image_results": image_results,
+                "commit": data.get("commit", {}),
+                "did": data["did"],
+            })
+    finally:
+        await model_pool.put(model)
 
-                # Process images if present
-                if image_urls:
-                    tasks = [
-                        process_single_image(url, model, transform, device, config, cid)
-                        for url, cid in image_urls
-                    ]
-                    image_results = await asyncio.gather(*tasks)
+    labels_applied = 0
+    for result in results:
+        for image_result in result["image_results"]:
+            for label, score in image_result.get("labels", {}).items():
+                if label != "negative" and float(score) > THRESHOLD:
+                    await create_label(result)
+                    labels_applied += 1
 
-                # Collect the results for this input
-                results.append(
-                    {
-                        "image_results": image_results,
-                        "timing": {"total_time": time.time() - start_time},
-                        "commit": data.get("commit", {}),
-                        "did": data["did"],
-                    }
-                )
-        finally:
-            print(time.time() - start_time)
-            # Return models to the pool after the entire batch is processed
-            # await embedder_pool.put(embedder)
-            await model_pool.put(model)
-        # Return results list if multiple inputs, else a single result dictionary
+    duration = time.time() - start_time
+    total_images = sum(len(r["image_results"]) for r in results)
+    log_metric(total_images, labels_applied, duration)
+    logger.info("job done images=%d labels=%d duration=%.2fs", total_images, labels_applied, duration)
 
-        for result in results:
-            for image_result in result["image_results"]:
-                for label, score in image_result.get("labels", {}).items():
-                    if label != "negative" and float(score) > THRESHOLD:
-                        await create_label(result)
-
-        return results if len(results) > 1 else results[0]
-    except Exception as e:
-        print(e)
-        return {"error": str(e)}
+    return results if len(results) > 1 else results[0]
 
 
-def adjust_concurrency(current_concurrency):
-    """
-    Adjusts the concurrency level based on the current request rate.
-    For this example, we'll keep the concurrency level fixed.
-    """
-    return NUM_WORKERS
-
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
     await auth_client()
 
-    # Create an event that will be triggered for shutdown
     shutdown_event = asyncio.Event()
 
-    def signal_handler(signal, frame):
-        print("Signal received, shutting down.")
+    def signal_handler(sig, frame):
+        logger.info("Signal %s received, shutting down...", sig)
         shutdown_event.set()
 
-    # Assign signal handlers to SIGTERM and SIGINT
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    print("starting worker")
-
-    # Feel free to remove the connection parameter, if your redis runs on localhost
+    logger.info("Starting BullMQ worker...")
     worker = Worker(
         "xblock",
         process_request,
-        {"connection": os.environ["REDIS_CONNECTION_STRING"], "concurrency": 50},
+        {"connection": os.environ["REDIS_CONNECTION_STRING"], "concurrency": NUM_WORKERS},
     )
 
-    # Wait until the shutdown event is set
     await shutdown_event.wait()
 
-    # close the worker
-    print("Cleaning up worker...")
+    logger.info("Closing worker...")
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
     await worker.close(force=True)
-    print("Worker shut down successfully.")
+    logger.info("Worker shut down cleanly.")
 
 
 if __name__ == "__main__":
