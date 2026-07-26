@@ -2,8 +2,9 @@ module.exports = {
   apps: [
     {
       name: "xblock-firehose",
-      script: "node_modules/.bin/tsx",
-      args: "-r dotenv/config lib/firehose.ts",
+      script: "lib/firehose.ts",
+      interpreter: "./node_modules/.bin/tsx",
+      interpreter_args: "-r dotenv/config",
       autorestart: true,
       // Exponential backoff: 1s → 2s → 4s … capped at 15s by pm2.
       // The dead man's switch already adds a ~5 min delay before exiting,
