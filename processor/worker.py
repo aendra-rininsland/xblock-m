@@ -20,7 +20,7 @@ from io import BytesIO
 from PIL import Image
 from safetensors.torch import load_file
 from timm import create_model
-from constants import THRESHOLD
+from constants import MAX_JOB_AGE_MS, THRESHOLD
 from preprocessing import IMG_SIZE, build_transform
 from moderate import auth_client, create_label
 
