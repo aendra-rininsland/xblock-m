@@ -102,9 +102,15 @@ notebook (drop `news`, rename `altright` → `truthsocial`).
 deduplicated on first sight. 37 of 1,581 distinct images are filed twice — but
 only 6 are genuine co-occurrence (0.38%). The other 31 pair a platform with
 `negative`, which is a contradiction rather than a co-occurrence (29 are
-`discord + negative`, which looks like one bulk misfile). Those import with **no
-label** and are queued for review rather than resolved by guessing which folder
-was wrong.
+`discord + negative`, which looks like one bulk misfile). Those are resolved from `conflict_resolutions.json` where a human has recorded a
+decision, and otherwise import with **no label** and go to the review queue —
+never guessed.
+
+The 29 `discord + negative` images were reviewed by hand: 27 are Discord, 2 are
+genuinely negative. That means the `negative` class was ~15% Discord screenshots,
+which matters more than the count suggests, since negatives are what govern the
+false-positive rate. The decisions live in the repo so they survive rebuilding
+the manifest from scratch.
 
 **For the other 99.6%, labels are still "at least this", not "exactly this."**
 0.38% is the rate at which somebody bothered to file an image twice — a lower

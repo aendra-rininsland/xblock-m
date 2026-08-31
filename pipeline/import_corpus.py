@@ -47,17 +47,19 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 from collections import Counter
 
-from manifest import (CLASSES, IMPORTED, NEEDS_DETAIL, NEGATIVE, connect,
+from manifest import (CLASSES, DONE, IMPORTED, NEEDS_DETAIL, NEGATIVE, connect,
                       image_path)
 
 HF_DATASET = "howdyaendra/xblock-social-screenshots"
 SOURCE = "imagefolder-v1"
+HUMAN = "human"
 
 # Kept identical to cell 11 of xblock-notebooks/xblock-m-timm.ipynb.
 DROP_CLASSES = {"news"}
@@ -86,20 +88,47 @@ def cid_from_filename(path: str) -> str | None:
     return stem if stem.startswith("bafkrei") and stem.isalnum() else None
 
 
-def resolve_labels(labels: set[str]) -> tuple[set[str], str, bool]:
-    """Decide the final label set and review state for one imported CID.
+RESOLUTIONS_FILE = Path(__file__).parent / "conflict_resolutions.json"
 
-    Returns (labels, state, is_conflict).
 
-    A CID in two folders carries both labels -- except when one of them is
-    `negative`, which means "not a screenshot" and so cannot hold alongside a
-    platform label. That is a filing error, not a co-occurrence, and there is no
-    way to tell from the outside which folder was wrong. Import it with no label
-    so it stays out of training, and queue it for a human.
+def load_resolutions(path: Path = RESOLUTIONS_FILE) -> dict[str, list[str]]:
+    """Human decisions on CIDs whose folders contradict each other.
+
+    Recorded in the repo rather than left to the review UI so the judgement is
+    versioned, reviewable in a diff, and survives rebuilding the manifest from
+    scratch. Without it these images would go back into the review queue every
+    time the database is recreated.
+    """
+    if not path.exists():
+        return {}
+    with path.open() as f:
+        return json.load(f).get("resolutions", {})
+
+
+def resolve_labels(cid: str, labels: set[str],
+                   resolutions: dict[str, list[str]] | None = None
+                   ) -> tuple[set[str], str, str, str]:
+    """Decide the final labels, source and review state for one imported CID.
+
+    Returns (labels, source, state, kind) where kind is one of
+    'single' | 'multi' | 'resolved' | 'conflict'.
+
+    A CID in two folders carries both labels -- except when one is `negative`,
+    which means "not a screenshot of a post" and so cannot hold alongside a
+    platform label. That is a filing error, not a co-occurrence, and nothing in
+    the data says which folder was wrong. If a human has recorded a decision,
+    use it; otherwise import with no label so the image stays out of training,
+    and queue it for review.
     """
     if NEGATIVE in labels and len(labels) > 1:
-        return set(), NEEDS_DETAIL, True
-    return set(labels), IMPORTED, False
+        decided = (resolutions or {}).get(cid)
+        if decided:
+            # A real human decision, so it counts as one -- but see the note in
+            # conflict_resolutions.json: it settled this contradiction, not an
+            # exhaustive multi-label pass.
+            return set(decided), HUMAN, DONE, "resolved"
+        return set(), SOURCE, NEEDS_DETAIL, "conflict"
+    return set(labels), SOURCE, IMPORTED, ("multi" if len(labels) > 1 else "single")
 
 
 def main() -> None:
@@ -167,7 +196,9 @@ def main() -> None:
     counts: dict[str, int] = {}
     imported = skipped_existing = 0
     conflicts: list[tuple[str, list[str]]] = []
+    resolved: list[tuple[str, list[str], list[str]]] = []
     multi: list[tuple[str, list[str]]] = []
+    resolutions = load_resolutions()
 
     for cid, labels in labels_by_cid.items():
         if cid in existing:
@@ -175,10 +206,12 @@ def main() -> None:
             continue
 
         original_labels = sorted(labels)
-        labels, state, is_conflict = resolve_labels(labels)
-        if is_conflict:
+        labels, source, state, kind = resolve_labels(cid, labels, resolutions)
+        if kind == "conflict":
             conflicts.append((cid, original_labels))
-        elif len(labels) > 1:
+        elif kind == "resolved":
+            resolved.append((cid, original_labels, sorted(labels)))
+        elif kind == "multi":
             multi.append((cid, original_labels))
 
         if args.apply:
@@ -195,7 +228,7 @@ def main() -> None:
             for label_name in labels:
                 conn.execute(
                     "INSERT OR REPLACE INTO labels (cid,label,source,created_at)"
-                    " VALUES (?,?,?,?)", (cid, label_name, SOURCE, now))
+                    " VALUES (?,?,?,?)", (cid, label_name, source, now))
             conn.execute(
                 "INSERT INTO review_state (cid,state,updated_at) VALUES (?,?,?) "
                 "ON CONFLICT(cid) DO UPDATE SET state=excluded.state",
@@ -220,7 +253,14 @@ def main() -> None:
     print(f"\nmulti-label (filed in two folders): {len(multi)}")
     for cid, ls in multi:
         print(f"  {' + '.join(ls)}")
-    print(f"\ncontradictions (platform + negative): {len(conflicts)}")
+    if resolved:
+        print(f"\nresolved from conflict_resolutions.json: {len(resolved)}")
+        for pair, n in sorted(Counter(
+                f"{' + '.join(o)}  ->  {' + '.join(f)}" for _, o, f in resolved).items(),
+                key=lambda kv: -kv[1]):
+            print(f"  {pair:<40}{n:>4}")
+
+    print(f"\nunresolved contradictions (platform + negative): {len(conflicts)}")
     for pair, n in sorted(Counter(" + ".join(ls) for _, ls in conflicts).items(),
                           key=lambda kv: -kv[1]):
         print(f"  {pair:<28}{n:>4}")
