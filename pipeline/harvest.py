@@ -28,6 +28,9 @@ negatives that teach nothing. Buckets:
              false positives: the negatives actually worth labelling.
   uncertain  Max non-negative score in the uncertainty band. Where the decision
              boundary is, so where new labels move it most.
+  multi-cand Two or more classes scoring meaningfully. Nested screenshots -- the
+             case the single-label corpus could never express -- which random
+             sampling will essentially never turn up.
 
 Bucketing needs --score (loads the model). Without it everything is `random`,
 which is still the single most useful thing to collect right now.
@@ -73,6 +76,9 @@ CDN = "https://cdn.bsky.app/img/feed_thumbnail/plain/{did}/{cid}@jpeg"
 
 DEFAULT_DB = os.getenv("PIPELINE_DB") or str(Path(__file__).parent / "data" / "pipeline.db")
 UNCERTAIN_BAND = (0.35, 0.75)
+# Second-highest non-negative score at or above this makes an image a candidate
+# for carrying more than one label.
+MULTI_CANDIDATE_FLOOR = 0.35
 FETCH_CONCURRENCY = 16
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
@@ -157,9 +163,25 @@ def eligible_images(evt: dict) -> tuple[str, str, list[str]] | None:
 
 
 def classify_bucket(scores: dict[str, float], threshold: float) -> str:
-    """Which stratum this image belongs to, given the current model's opinion."""
-    non_neg = [v for k, v in scores.items() if k != "negative"]
-    top = max(non_neg) if non_neg else 0.0
+    """Which stratum this image belongs to, given the current model's opinion.
+
+    multi-candidate is checked before fired: an image scoring twitter 0.95 and
+    bluesky 0.4 is both a false-positive candidate and a co-occurrence candidate,
+    and the second reading is the scarcer one. Nested screenshots are the case
+    the single-label corpus could never teach, and random sampling will almost
+    never surface them.
+
+    Worth knowing this is partly circular -- a model trained only on single-label
+    data is biased toward one confident class, so it under-reports exactly what
+    is being mined. A genuinely nested image still presents visual evidence for
+    both platforms, so it should surface them far better than chance, but the
+    yield is worth measuring rather than assuming.
+    """
+    non_neg = sorted((v for k, v in scores.items() if k != "negative"), reverse=True)
+    top = non_neg[0] if non_neg else 0.0
+    second = non_neg[1] if len(non_neg) > 1 else 0.0
+    if second >= MULTI_CANDIDATE_FLOOR:
+        return "multi-candidate"
     if top >= threshold:
         return "fired"
     if UNCERTAIN_BAND[0] <= top <= UNCERTAIN_BAND[1]:
@@ -387,7 +409,7 @@ def main() -> None:
     h.add_argument("--score", action="store_true", help="score while harvesting (needs torch)")
     h.add_argument("--model", default=os.getenv("MODEL_NAME", "swin_s3_base_224-xblockm-timm"))
     h.add_argument("--threshold", type=float, default=float(os.getenv("INFERENCE_THRESHOLD", "0.8")))
-    h.add_argument("--bucket", choices=["random", "fired", "uncertain"],
+    h.add_argument("--bucket", choices=["random", "fired", "uncertain", "multi-candidate"],
                    help="keep only this bucket (implies --score)")
     h.set_defaults(fn=harvest)
 
@@ -395,7 +417,7 @@ def main() -> None:
     s.set_defaults(fn=stats)
 
     e = sub.add_parser("export", help="emit a JSONL review queue")
-    e.add_argument("--bucket", choices=["random", "fired", "uncertain"])
+    e.add_argument("--bucket", choices=["random", "fired", "uncertain", "multi-candidate"])
     e.add_argument("--split", help="a split name, or 'unassigned'")
     e.add_argument("--limit", type=int, default=1000)
     e.add_argument("--out", default="-")

@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from manifest import (CLASSES, DONE, NEEDS_DETAIL, NEGATIVE, PENDING,
+from manifest import (CLASSES, DONE, IMPORTED, NEEDS_DETAIL, NEGATIVE, PENDING,
                       PLATFORM_CLASSES, SKIPPED, connect, image_path)
 
 app = FastAPI(title="xblock review")
@@ -101,8 +101,13 @@ async def queue(mode: str = "sweep", bucket: str = "", limit: int = 60):
     detail -> whatever the sweep flagged, then anything still pending
     """
     conn = db()
-    where = ["i.cid NOT IN (SELECT cid FROM review_state WHERE state IN (?,?))"]
-    params: list = [DONE, SKIPPED]
+    # Imported ImageFolder rows already carry a label, so they stay out of the
+    # default queue -- but selecting their bucket explicitly is how the
+    # re-review pass surfaces them.
+    hidden = [DONE, SKIPPED] if bucket else [DONE, SKIPPED, IMPORTED]
+    where = [f"i.cid NOT IN (SELECT cid FROM review_state WHERE state IN "
+             f"({','.join('?' * len(hidden))}))"]
+    params: list = [*hidden]
     if bucket:
         where.append("i.bucket = ?")
         params.append(bucket)

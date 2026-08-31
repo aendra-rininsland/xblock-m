@@ -28,6 +28,7 @@ negatives that teach nothing. So:
 | `random` | unbiased sample of the production stream | the true prior — what a frozen eval set needs and a curated corpus cannot give you |
 | `fired` | model scores ≥ threshold on some class | candidate false positives: the negatives actually worth labelling |
 | `uncertain` | top non-negative score in 0.35–0.75 | where the decision boundary is, so where new labels move it most |
+| `multi-candidate` | two classes both scoring ≥ 0.35 | nested screenshots — the case the single-label corpus could never express, and which random sampling essentially never turns up |
 
 `random` needs no model. `fired` and `uncertain` need `--score`.
 
@@ -86,6 +87,56 @@ that is the case the old ImageFolder corpus could not express.
 
 Nothing is auto-labelled. `negative` is only ever inferred from an explicit
 human submit of a sweep page.
+
+## Importing the existing corpus
+
+```bash
+python import_corpus.py --dry-run
+python import_corpus.py --apply
+```
+
+Pulls the ImageFolder dataset in, applying the same class surgery as the training
+notebook (drop `news`, rename `altright` → `truthsocial`).
+
+**Imported labels are "at least this", not "exactly this."** The old structure
+gave nobody anywhere to record that a `twitter/` image was *also* a Bluesky
+screenshot. That matters under `BCEWithLogitsLoss`, where an unrecorded positive
+becomes an explicit zero in the target — training the model to suppress the very
+co-occurrence you want it to learn.
+
+So imported rows get `source='imagefolder-v1'` and `review_state='imported'`,
+never `human`/`done`. They stay out of the default review queue but the
+`imported (re-review)` bucket filter surfaces them, and a human label supersedes
+the imported one.
+
+## Training from the manifest
+
+```python
+from dataset import load_manifest_dataset
+ds = load_manifest_dataset(DB, IMAGES, split="train")
+```
+
+`labels` arrives already multi-hot, replacing the notebook's
+
+```python
+labels = torch.tensor([[x] for x in batch['label']])
+batch['labels'] = nn.functional.one_hot(labels, num_classes).sum(dim=1)
+```
+
+which assumes exactly one integer label per image and so cannot express a
+co-occurrence however the model is trained.
+
+### Is multi-label actually worth it?
+
+```bash
+python dataset.py --co-occurrence
+```
+
+Reports how often a reviewed image carries more than one label. Imported rows
+never can, by construction, so the only meaningful rate is among human-reviewed
+images. Re-review a couple of hundred from the `imported` bucket and this answers
+both "how common are nested screenshots" and "how much label noise does a
+straight import carry" — before committing to more multi-label machinery.
 
 ## Schema
 

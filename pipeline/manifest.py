@@ -92,6 +92,10 @@ PENDING = "pending"            # never looked at
 NEEDS_DETAIL = "needs-detail"  # grid sweep said "this is a screenshot" -- needs classes
 DONE = "done"                  # labelled, including confirmed negative
 SKIPPED = "skipped"            # deliberately passed over (unclear, NSFW, broken)
+# Carries an ImageFolder label, which is "at least this", not "exactly this".
+# Distinct from DONE so a re-review pass can find rows nobody has confirmed under
+# the multi-label regime.
+IMPORTED = "imported"
 
 
 def connect(db_path: str) -> sqlite3.Connection:
