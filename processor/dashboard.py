@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 import subprocess
 import time
 from datetime import datetime
@@ -15,6 +16,7 @@ app = FastAPI(title="XBlock Dashboard")
 
 LOGS_DIR = Path(__file__).parent.parent / "logs"
 METRICS_FILE = LOGS_DIR / "metrics.jsonl"
+METRICS_DB = LOGS_DIR / "metrics.db"
 WORKER_LOG = LOGS_DIR / "worker.log"
 SUPERVISOR_CONF = Path(__file__).parent.parent / "supervisord.conf"
 
@@ -54,46 +56,42 @@ async def get_metrics():
 
     jobs_today = 0
     jobs_last_minute = 0
-    total_duration = 0.0
-    duration_count = 0
-
-    bucket_count = 30
+    avg_duration = 0.0
     buckets: dict[int, int] = {}
-    for i in range(bucket_count):
+    for i in range(30):
         ts = int((thirty_min_ago + i * 60) // 60) * 60
         buckets[ts] = 0
 
-    if METRICS_FILE.exists():
+    if METRICS_DB.exists():
         try:
-            with open(METRICS_FILE) as f:
-                for line in f:
-                    try:
-                        entry = json.loads(line)
-                        ts = entry["ts"]
-                        if ts >= midnight:
-                            jobs_today += 1
-                        if ts >= now - 60:
-                            jobs_last_minute += 1
-                        if "duration" in entry:
-                            total_duration += entry["duration"]
-                            duration_count += 1
-                        if ts >= thirty_min_ago:
-                            bucket = int(ts // 60) * 60
-                            if bucket in buckets:
-                                buckets[bucket] += 1
-                    except Exception:
-                        pass
+            conn = sqlite3.connect(f"file:{METRICS_DB}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            # All three queries are index-range scans on ts — no full table scan.
+            jobs_today = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE ts >= ?", (midnight,)
+            ).fetchone()[0]
+            jobs_last_minute = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE ts >= ?", (now - 60,)
+            ).fetchone()[0]
+            row = conn.execute(
+                "SELECT AVG(duration) FROM jobs WHERE ts >= ?", (thirty_min_ago,)
+            ).fetchone()[0]
+            avg_duration = round(row, 2) if row else 0.0
+            for r in conn.execute(
+                "SELECT CAST(ts/60 AS INT)*60 AS bucket, COUNT(*) FROM jobs "
+                "WHERE ts >= ? GROUP BY bucket", (thirty_min_ago,)
+            ):
+                if r[0] in buckets:
+                    buckets[r[0]] = r[1]
+            conn.close()
         except Exception:
             pass
-
-    timeline = [{"ts": k, "count": v} for k, v in sorted(buckets.items())]
-    avg_duration = round(total_duration / duration_count, 2) if duration_count else 0
 
     return {
         "jobs_per_minute": jobs_last_minute,
         "jobs_today": jobs_today,
         "avg_duration": avg_duration,
-        "timeline": timeline,
+        "timeline": [{"ts": k, "count": v} for k, v in sorted(buckets.items())],
     }
 
 
@@ -107,29 +105,6 @@ async def get_logs(lines: int = 200):
     return {"lines": result.stdout.splitlines()}
 
 
-async def _tail_log():
-    if not WORKER_LOG.exists():
-        LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        WORKER_LOG.touch()
-
-    proc = await asyncio.create_subprocess_exec(
-        "tail", "-n", "50", "-f", str(WORKER_LOG),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    try:
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            yield f"data: {json.dumps(line.decode().rstrip())}\n\n"
-    finally:
-        proc.terminate()
-
-
-@app.get("/api/logs/stream")
-async def stream_logs():
-    return StreamingResponse(_tail_log(), media_type="text/event-stream")
 
 
 HTML = r"""<!DOCTYPE html>
@@ -305,32 +280,43 @@ async function refreshMetrics() {
   }
 }
 
-function appendLog(line) {
+let _lastLogLine = null;
+
+async function refreshLogs() {
+  const res = await fetch('/api/logs?lines=50');
+  const data = await res.json();
+  const lines = data.lines;
+  if (!lines.length) return;
+
   const box = document.getElementById('log-box');
-  const el = document.createElement('div');
-  el.className = 'line';
-  el.textContent = line;
-  box.appendChild(el);
-  if (box.children.length > 500) box.removeChild(box.firstChild);
+
+  // On first load show everything; on subsequent polls append only new lines.
+  let startIdx = 0;
+  if (_lastLogLine !== null) {
+    const idx = lines.lastIndexOf(_lastLogLine);
+    startIdx = idx === -1 ? 0 : idx + 1;
+  }
+
+  const newLines = lines.slice(startIdx);
+  if (!newLines.length) return;
+
+  _lastLogLine = lines[lines.length - 1];
+  newLines.forEach(line => {
+    const el = document.createElement('div');
+    el.className = 'line';
+    el.textContent = line;
+    box.appendChild(el);
+  });
+  while (box.children.length > 500) box.removeChild(box.firstChild);
   if (autoScroll) box.scrollTop = box.scrollHeight;
 }
 
-async function initLogs() {
-  const res = await fetch('/api/logs?lines=80');
-  const data = await res.json();
-  data.lines.forEach(appendLog);
-
-  const evtSource = new EventSource('/api/logs/stream');
-  evtSource.onmessage = e => appendLog(JSON.parse(e.data));
-}
-
 async function tick() {
-  await Promise.all([refreshStatus(), refreshMetrics()]);
+  await Promise.all([refreshStatus(), refreshMetrics(), refreshLogs()]);
 }
 
 tick();
-initLogs();
-setInterval(tick, 5000);
+setInterval(tick, 15000);
 </script>
 </body>
 </html>"""

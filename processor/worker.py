@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 import asyncio
 from asyncio import Queue
+import datetime
 import json
 import logging
 import os
 import signal
+import sqlite3
 import time
 
 
@@ -38,15 +40,76 @@ logging.basicConfig(
 logger = logging.getLogger("xblock")
 
 
+METRICS_DB = os.path.join(LOG_DIR, "metrics.db")
+
+def _init_metrics_db() -> None:
+    conn = sqlite3.connect(METRICS_DB)
+    conn.execute("""CREATE TABLE IF NOT EXISTS jobs (
+        ts REAL, images INTEGER, labels_applied INTEGER, duration REAL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ts ON jobs(ts)")
+    conn.commit()
+    conn.close()
+
+_init_metrics_db()
+
+
 def log_metric(images: int, labels_applied: int, duration: float) -> None:
-    entry = json.dumps({
-        "ts": time.time(),
-        "images": images,
-        "labels_applied": labels_applied,
-        "duration": duration,
-    })
+    ts = time.time()
+    # JSONL kept for compatibility/backup; SQLite is what the dashboard queries.
+    entry = json.dumps({"ts": ts, "images": images, "labels_applied": labels_applied, "duration": duration})
     with open(METRICS_FILE, "a") as f:
         f.write(entry + "\n")
+    try:
+        conn = sqlite3.connect(METRICS_DB)
+        conn.execute("INSERT INTO jobs VALUES (?,?,?,?)", (ts, images, labels_applied, duration))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning("metrics db write failed: %s", e)
+
+
+# ── Pipeline DB ───────────────────────────────────────────────────────────────
+# Optional: set PIPELINE_DB to the absolute path of the retraining pipeline's
+# SQLite database so that model scores are available to the auto-labeller.
+# Example (WSL2): /mnt/d/Claude/Projects/Projects/XBlock Training Pipeline/data/pipeline.db
+PIPELINE_DB = os.getenv("PIPELINE_DB", "")
+if PIPELINE_DB:
+    if os.path.exists(PIPELINE_DB):
+        logger.info("Pipeline DB found at %s — model scores will be persisted.", PIPELINE_DB)
+    else:
+        logger.warning("PIPELINE_DB is set to %s but file does not exist yet. "
+                       "Scores will be written once the pipeline has run at least once.", PIPELINE_DB)
+
+
+def write_model_scores(image_results: list) -> None:
+    """Persist model confidence scores to the pipeline DB for the auto-labeller."""
+    if not PIPELINE_DB:
+        return
+    try:
+        conn = sqlite3.connect(PIPELINE_DB)
+        try:
+            for r in image_results:
+                if r.get("error") or not r.get("labels"):
+                    continue
+                labels: dict = r["labels"]
+                if not labels:
+                    continue
+                top_label = next(iter(labels))
+                top_score = labels[top_label]
+                scored_at = datetime.datetime.utcnow().isoformat() + "Z"
+                conn.execute(
+                    """INSERT OR REPLACE INTO model_scores
+                         (image_cid, top_label, top_score, all_scores, scored_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (r["blob_cid"], top_label, float(top_score),
+                     json.dumps(labels), scored_at),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error("Failed to write model scores to pipeline DB: %s", e)
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -199,6 +262,7 @@ async def process_request(job, token):
             if image_urls:
                 tasks = [process_single_image(url, model, cid) for url, cid in image_urls]
                 image_results = await asyncio.gather(*tasks)
+                write_model_scores(image_results)
 
             results.append({
                 "image_results": image_results,
