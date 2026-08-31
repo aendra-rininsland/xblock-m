@@ -172,7 +172,7 @@ async function load() {
   const limit = MODE === 'sweep' ? 60 : 40;
   const d = await api(`/api/queue?mode=${MODE}&bucket=${bucket}&limit=${limit}`);
   ITEMS = d ? d.items : [];
-  render(); refreshStats();
+  if (MODE === 'detail') { goTo(0); refreshStats(); } else { render(); refreshStats(); }
 }
 
 function render() { MODE === 'sweep' ? renderSweep() : renderDetail(); }
@@ -215,6 +215,17 @@ async function submitSweep() {
 }
 
 /* ── detail ────────────────────────────────────────────────────────────── */
+function goTo(idx) {
+  CUR = idx;
+  SEL.clear();
+  // Seed from whatever the image already carries. Reviewing an imported or
+  // partly-labelled image is additive -- confirming a second platform -- not
+  // retyping what is already known.
+  const it = ITEMS[CUR];
+  if (it) (it.labels || []).forEach(l => SEL.add(l));
+  renderDetail();
+}
+
 function renderDetail() {
   if (CUR >= ITEMS.length) { $('#main').innerHTML =
     '<div class="empty">Queue finished. Reload for more.</div>';
@@ -244,6 +255,7 @@ function renderDetail() {
           <h2>Context</h2>
           <div class="meta">
             <span class="pill">${it.bucket}</span>
+            ${(it.labels || []).length ? ` <span class="pill" style="border-color:var(--accent);color:var(--accent)">${it.labels.length} existing</span>` : ''}
             ${it.state ? ` <span class="pill">${it.state}</span>` : ''}
             <div style="margin-top:8px">${CUR + 1} of ${ITEMS.length}</div>
             <div style="margin-top:6px"><a href="${bskyLink(it.post_uri)}"
@@ -284,14 +296,14 @@ async function saveDetail() {
   const r = await api('/api/label', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ cid: it.cid, labels: [...SEL] }) });
-  if (r) { SEL.clear(); CUR++; renderDetail(); refreshStats(); }
+  if (r) { goTo(CUR + 1); refreshStats(); }
 }
 
 async function skip() {
   const it = ITEMS[CUR]; if (!it) return;
   await api('/api/label', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ cid: it.cid, labels: [], skip: true }) });
-  SEL.clear(); CUR++; renderDetail(); refreshStats();
+  goTo(CUR + 1); refreshStats();
 }
 
 async function doUndo() {
@@ -309,8 +321,8 @@ document.addEventListener('keydown', e => {
   if (MODE !== 'detail') return;
 
   if (k === 's') { e.preventDefault(); skip(); return; }
-  if (k === 'arrowright') { e.preventDefault(); if (CUR < ITEMS.length - 1) { CUR++; SEL.clear(); renderDetail(); } return; }
-  if (k === 'arrowleft')  { e.preventDefault(); if (CUR > 0) { CUR--; SEL.clear(); renderDetail(); } return; }
+  if (k === 'arrowright') { e.preventDefault(); if (CUR < ITEMS.length - 1) goTo(CUR + 1); return; }
+  if (k === 'arrowleft')  { e.preventDefault(); if (CUR > 0) goTo(CUR - 1); return; }
   if (k === NEG_KEY) { e.preventDefault(); toggleClass(CFG.negative); return; }
   const i = KEYS.indexOf(k);
   if (i >= 0 && i < CFG.platforms.length) { e.preventDefault(); toggleClass(CFG.platforms[i]); }

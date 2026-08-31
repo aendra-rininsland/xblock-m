@@ -133,8 +133,13 @@ async def queue(mode: str = "sweep", bucket: str = "", limit: int = 60):
         scores = json.loads(r["all_scores"]) if r["all_scores"] else None
         if scores:
             scores = dict(sorted(scores.items(), key=lambda kv: -kv[1])[:4])
+        # Existing labels come back so the UI can pre-select them. Review of an
+        # already-labelled image is additive -- confirming a second platform --
+        # not re-entry from scratch.
+        labels = [x[0] for x in conn.execute(
+            "SELECT label FROM labels WHERE cid = ?", (r["cid"],))]
         items.append({"cid": r["cid"], "bucket": r["bucket"], "post_uri": r["post_uri"],
-                      "state": r["state"], "scores": scores})
+                      "state": r["state"], "scores": scores, "labels": sorted(set(labels))})
     conn.close()
     return {"items": items}
 

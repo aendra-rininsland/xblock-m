@@ -24,9 +24,10 @@ Reporting
 ---------
     python dataset.py --co-occurrence
 
-answers the question that decides how much any of this matters: how often does an
-image actually carry more than one label? Imported ImageFolder rows never can, by
-construction, so the interesting figure is the rate among human-reviewed images.
+reports multi-label COVERAGE: how many examples of each class co-occur with
+another. Multi-label is a design property of the system, not something the data
+has to justify -- but a class with no co-occurrence examples still cannot learn
+to co-occur, so this is how you see which classes are covered and which are not.
 """
 from __future__ import annotations
 
@@ -159,25 +160,27 @@ def main() -> None:
 
     if args.co_occurrence:
         rev, rev_multi = s["reviewed"], s["reviewed_multi"]
-        print("\n── co-occurrence ─────────────────────────────────────────────")
-        print("Imported ImageFolder rows cannot carry more than one label, so the")
-        print("only meaningful rate is among human-reviewed images.\n")
-        if not rev:
-            print("  No human-reviewed images yet. Review a few hundred (the")
-            print("  `imported` bucket in the review UI is the cheapest sample)")
-            print("  and re-run -- that rate decides how much the multi-label")
-            print("  path is worth investing in.")
-        else:
-            pct = len(rev_multi) / len(rev) * 100
-            print(f"  human-reviewed        {len(rev):>7,}")
-            print(f"  ...with >1 label      {len(rev_multi):>7,}  ({pct:.1f}%)")
-            if s["pairs"]:
-                print("\n  commonest pairs")
-                for (a, b), n in s["pairs"].most_common(10):
-                    print(f"    {a} + {b:<16}{n:>6,}")
-            verdict = ("worth the multi-label work" if pct >= 5 else
-                       "rare -- a straight import carries little label noise")
-            print(f"\n  {pct:.1f}% -> {verdict}")
+        multi_all = [r for r in rows if len(r["labels"]) > 1]
+        print("\n── multi-label coverage ──────────────────────────────────────")
+        print(f"  images with >1 label   {len(multi_all):>7,}  of {len(rows):,}")
+        print(f"  human-reviewed         {len(rev):>7,}")
+        print(f"  ...with >1 label       {len(rev_multi):>7,}")
+
+        if s["pairs"]:
+            print("\n  observed pairs")
+            for (a, b), n in s["pairs"].most_common(15):
+                print(f"    {a} + {b:<18}{n:>6,}")
+
+        # A class the model never sees co-occurring cannot learn to co-occur, so
+        # the useful view is per class, not one headline percentage.
+        covered = {c for pair in s["pairs"] for c in pair}
+        missing = [c for c in CLASSES if c != "negative"
+                   and s["per_class"].get(c, 0) and c not in covered]
+        print("\n  classes with NO co-occurrence example yet:")
+        print("    " + (", ".join(missing) if missing else "(none)"))
+        if missing:
+            print("\n  These can only ever be predicted alone. The multi-candidate")
+            print("  harvest bucket targets exactly this gap.")
 
 
 if __name__ == "__main__":

@@ -54,7 +54,7 @@ from pathlib import Path
 
 from collections import Counter
 
-from manifest import (CLASSES, DONE, IMPORTED, NEEDS_DETAIL, NEGATIVE, connect,
+from manifest import (CLASSES, IMPORTED, NEEDS_DETAIL, NEGATIVE, connect,
                       image_path)
 
 HF_DATASET = "howdyaendra/xblock-social-screenshots"
@@ -123,10 +123,13 @@ def resolve_labels(cid: str, labels: set[str],
     if NEGATIVE in labels and len(labels) > 1:
         decided = (resolutions or {}).get(cid)
         if decided:
-            # A real human decision, so it counts as one -- but see the note in
-            # conflict_resolutions.json: it settled this contradiction, not an
-            # exhaustive multi-label pass.
-            return set(decided), HUMAN, DONE, "resolved"
+            # source=human because a person really did decide this. state stays
+            # IMPORTED, not DONE: the decision settled which of two contradictory
+            # folders was right, and said nothing about whether a second platform
+            # also appears in the image. Marking it DONE would assert "this label
+            # and no other" -- a claim nobody made -- and would permanently
+            # remove it from the review queue.
+            return set(decided), HUMAN, IMPORTED, "resolved"
         return set(), SOURCE, NEEDS_DETAIL, "conflict"
     return set(labels), SOURCE, IMPORTED, ("multi" if len(labels) > 1 else "single")
 

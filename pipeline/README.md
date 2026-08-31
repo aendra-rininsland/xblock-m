@@ -112,9 +112,12 @@ which matters more than the count suggests, since negatives are what govern the
 false-positive rate. The decisions live in the repo so they survive rebuilding
 the manifest from scratch.
 
-**For the other 99.6%, labels are still "at least this", not "exactly this."**
-0.38% is the rate at which somebody bothered to file an image twice — a lower
-bound on true co-occurrence, not a measurement of it. That matters under `BCEWithLogitsLoss`, where an unrecorded positive
+**Imported labels are "at least this", not "exactly this."** Double-filing is a
+lower bound on co-occurrence, not a measurement: a nested screenshot filed once
+under its dominant platform is indistinguishable from a single-platform one. That
+is why imported rows keep `review_state='imported'` and stay re-reviewable rather
+than being marked done — including the 29 conflict resolutions, which settled
+which folder was right and said nothing about whether a second platform appears. That matters under `BCEWithLogitsLoss`, where an unrecorded positive
 becomes an explicit zero in the target — training the model to suppress the very
 co-occurrence you want it to learn.
 
@@ -140,17 +143,18 @@ batch['labels'] = nn.functional.one_hot(labels, num_classes).sum(dim=1)
 which assumes exactly one integer label per image and so cannot express a
 co-occurrence however the model is trained.
 
-### Is multi-label actually worth it?
+### Multi-label coverage
 
 ```bash
 python dataset.py --co-occurrence
 ```
 
-Reports how often a reviewed image carries more than one label. Imported rows
-never can, by construction, so the only meaningful rate is among human-reviewed
-images. Re-review a couple of hundred from the `imported` bucket and this answers
-both "how common are nested screenshots" and "how much label noise does a
-straight import carry" — before committing to more multi-label machinery.
+Multi-label is a design property of the system — the head is sigmoid and a
+screenshot of a screenshot genuinely carries two labels. The data doesn't have to
+justify that. But a class the model never sees co-occurring **cannot learn to
+co-occur**, so this reports coverage: which pairs have been observed, and which
+classes have no co-occurrence example at all. Those can only ever be predicted
+alone, and the `multi-candidate` harvest bucket targets exactly that gap.
 
 ## Schema
 
