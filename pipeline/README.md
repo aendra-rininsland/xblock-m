@@ -55,6 +55,38 @@ python harvest.py export --split unassigned --out review.jsonl
 `--db` defaults to `$PIPELINE_DB` if set, so this can share the database
 `processor/worker.py` already writes model scores into.
 
+## Review
+
+```bash
+python review.py --db data/pipeline.db --images data/images
+# http://127.0.0.1:8081
+```
+
+Two modes, because the work has two shapes:
+
+**Sweep** — a grid of thumbnails. Click the few that *are* screenshots; everything
+left unclicked is recorded as `negative` on submit. This is how ~3,000 negatives
+get labelled in well under an hour. Thumbnails are top-anchored rather than
+centre-cropped: platform chrome lives along the top edge, and centre-cropping a
+tall screenshot to a square throws away the part you are judging.
+
+**Detail** — one image at a time, multi-select by keyboard. For whatever the
+sweep flagged, and for the `fired` and `uncertain` buckets where the judgement
+matters. Model scores are shown inline per class.
+
+| key | |
+|---|---|
+| `1`–`9`, `q`, `w` | platform classes, ordered by corpus frequency |
+| `0` | negative — exclusive, clears the rest |
+| `↵` | confirm page (sweep) / save and advance (detail) |
+| `s` `u` `←` `→` | skip, undo, navigate |
+
+Multi-select is the point: a nested screenshot fires more than one class, and
+that is the case the old ImageFolder corpus could not express.
+
+Nothing is auto-labelled. `negative` is only ever inferred from an explicit
+human submit of a sweep page.
+
 ## Schema
 
 - `images` — one row per distinct image. `cid` is a content hash, so byte-identical
@@ -64,6 +96,9 @@ python harvest.py export --split unassigned --out review.jsonl
 - `splits` — kept apart from `labels` so relabelling an image can never silently
   move it between train and eval. A frozen eval set only stays frozen if its
   membership lives somewhere relabelling does not touch.
+- `review_state` — review progress, kept apart from `labels` so "confirmed
+  negative" and "not looked at yet" stay distinguishable. Without it an image
+  with no labels is ambiguous and a 3,000-image sweep cannot be resumed.
 - `model_scores` — shape-compatible with what `worker.py` already writes.
 
 ## Notes

@@ -60,6 +60,8 @@ from pathlib import Path
 
 import aiohttp
 
+from manifest import connect, image_path
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("harvest")
 
@@ -73,79 +75,6 @@ DEFAULT_DB = os.getenv("PIPELINE_DB") or str(Path(__file__).parent / "data" / "p
 UNCERTAIN_BAND = (0.35, 0.75)
 FETCH_CONCURRENCY = 16
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
-
-
-# ── schema ────────────────────────────────────────────────────────────────────
-
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-
--- One row per distinct image. cid is a content hash, so this deduplicates
--- byte-identical re-uploads for free and makes harvests resumable.
-CREATE TABLE IF NOT EXISTS images (
-    cid          TEXT PRIMARY KEY,
-    did          TEXT NOT NULL,
-    rkey         TEXT NOT NULL,
-    post_uri     TEXT NOT NULL,
-    path         TEXT NOT NULL,
-    bytes        INTEGER,
-    harvested_at TEXT NOT NULL,
-    bucket       TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_images_bucket ON images(bucket);
-
--- The point of the exercise: an image carries a SET of labels, not one.
--- `source` records provenance, so a human decision can outrank a model guess
--- and an Ozone appeal can be told apart from a hand review.
-CREATE TABLE IF NOT EXISTS labels (
-    cid        TEXT NOT NULL,
-    label      TEXT NOT NULL,
-    source     TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (cid, label, source)
-);
-CREATE INDEX IF NOT EXISTS idx_labels_cid ON labels(cid);
-
--- Kept separate from labels so that relabelling an image never silently moves
--- it between train and eval. A frozen eval set only stays frozen if its
--- membership lives somewhere relabelling does not touch.
-CREATE TABLE IF NOT EXISTS splits (
-    cid         TEXT PRIMARY KEY,
-    split       TEXT NOT NULL,
-    assigned_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_splits_split ON splits(split);
-
--- Shape matches what processor/worker.py already writes, so the two can share a
--- database. Note image_cid is the sole primary key: one score row per image, not
--- one per (image, model). Storing scores from several models -- which shadow
--- comparison would want -- needs a migration first.
-CREATE TABLE IF NOT EXISTS model_scores (
-    image_cid  TEXT PRIMARY KEY,
-    top_label  TEXT,
-    top_score  REAL,
-    all_scores TEXT,
-    scored_at  TEXT,
-    model      TEXT
-);
-"""
-
-
-def connect(db_path: str) -> sqlite3.Connection:
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.executescript(SCHEMA)
-    # Older databases predate `model`; CREATE TABLE IF NOT EXISTS will not add it.
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(model_scores)")}
-    if "model" not in cols:
-        conn.execute("ALTER TABLE model_scores ADD COLUMN model TEXT")
-    conn.commit()
-    return conn
-
-
-def image_path(root: Path, cid: str) -> Path:
-    """Shard by the first two characters so no directory holds 10k+ files."""
-    return root / cid[:2] / f"{cid}.jpeg"
 
 
 # ── optional scoring ──────────────────────────────────────────────────────────
