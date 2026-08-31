@@ -48,8 +48,14 @@ def _init_metrics_db() -> None:
     # and the writer block each other ("database is locked").
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""CREATE TABLE IF NOT EXISTS jobs (
-        ts REAL, images INTEGER, labels_applied INTEGER, duration REAL
+        ts REAL, images INTEGER, labels_applied INTEGER, duration REAL,
+        errors INTEGER DEFAULT 0
     )""")
+    # Databases created before the errors column exist in the wild, and
+    # CREATE TABLE IF NOT EXISTS will not add it to them.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "errors" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN errors INTEGER DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ts ON jobs(ts)")
     conn.commit()
     conn.close()
@@ -66,7 +72,12 @@ def log_metric(images: int, labels_applied: int, duration: float, errors: int = 
         f.write(entry + "\n")
     try:
         conn = sqlite3.connect(METRICS_DB, timeout=5)
-        conn.execute("INSERT INTO jobs VALUES (?,?,?,?)", (ts, images, labels_applied, duration))
+        # Named columns rather than positional, so a future migration cannot
+        # silently shift the values.
+        conn.execute(
+            "INSERT INTO jobs (ts, images, labels_applied, duration, errors) VALUES (?,?,?,?,?)",
+            (ts, images, labels_applied, duration, errors),
+        )
         conn.commit()
         conn.close()
     except Exception as e:
@@ -192,40 +203,51 @@ def _run_batch(tensors: list[torch.Tensor]):
     return logits.sigmoid().cpu().numpy()
 
 
+def _fail_waiters(items: list, exc: BaseException) -> None:
+    """Resolve every future in `items`. A waiter left unresolved hangs its job."""
+    for _, future in items:
+        if not future.done():
+            future.set_exception(exc)
+
+
 async def _batch_loop() -> None:
     assert _infer_queue is not None
     loop = asyncio.get_running_loop()
     while True:
-        # Block until there is at least one request, then top up the batch until
-        # it is full or the wait window expires, whichever comes first.
-        items = [await _infer_queue.get()]
-        deadline = loop.time() + INFER_BATCH_WAIT_MS / 1000
-        while len(items) < INFER_BATCH_SIZE:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            try:
-                items.append(await asyncio.wait_for(_infer_queue.get(), remaining))
-            except asyncio.TimeoutError:
-                break
-
-        pending = [(t, f) for t, f in items if not f.done()]
-        if not pending:
-            continue
-
+        items: list = []
         try:
-            probs = await asyncio.to_thread(_run_batch, [t for t, _ in pending])
-        except Exception as e:
-            # Every waiter must be resolved or its job hangs forever.
-            logger.error("Batch inference failed (n=%d): %s", len(pending), e)
-            for _, f in pending:
-                if not f.done():
-                    f.set_exception(e)
-            continue
+            # Block until there is at least one request, then top up the batch
+            # until it is full or the wait window expires, whichever is first.
+            items.append(await _infer_queue.get())
+            deadline = loop.time() + INFER_BATCH_WAIT_MS / 1000
+            while len(items) < INFER_BATCH_SIZE:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    items.append(await asyncio.wait_for(_infer_queue.get(), remaining))
+                except asyncio.TimeoutError:
+                    break
 
-        for (_, f), row in zip(pending, probs):
-            if not f.done():
-                f.set_result(row)
+            pending = [(t, f) for t, f in items if not f.done()]
+            if not pending:
+                continue
+
+            probs = await asyncio.to_thread(_run_batch, [t for t, _ in pending])
+            for (_, f), row in zip(pending, probs):
+                if not f.done():
+                    f.set_result(row)
+
+        except asyncio.CancelledError:
+            # Shutdown. CancelledError is a BaseException, so without this the
+            # futures for any batch in flight would never resolve and their jobs
+            # would await them forever. Raise a plain exception at the waiters so
+            # process_single_image can catch it and return an error result.
+            _fail_waiters(items, RuntimeError("inference batcher stopped"))
+            raise
+        except Exception as e:
+            logger.error("Batch inference failed (n=%d): %s", len(items), e)
+            _fail_waiters(items, e)
 
 
 async def _infer(tensor: torch.Tensor):
@@ -386,13 +408,24 @@ async def main():
     _batcher_task = asyncio.create_task(_batch_loop())
 
     shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
-    def signal_handler(sig, frame):
-        logger.info("Signal %s received, shutting down...", sig)
+    def request_shutdown(sig_name: str) -> None:
+        logger.info("Signal %s received, shutting down...", sig_name)
         shutdown_event.set()
 
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            # add_signal_handler runs the callback on the loop. signal.signal
+            # would run it between bytecodes instead, where touching loop state
+            # is not safe.
+            loop.add_signal_handler(sig, request_shutdown, sig.name)
+        except NotImplementedError:
+            # Windows event loops have no add_signal_handler.
+            signal.signal(
+                sig,
+                lambda s, f: loop.call_soon_threadsafe(request_shutdown, signal.Signals(s).name),
+            )
 
     logger.info("Starting BullMQ worker...")
     worker = Worker(
