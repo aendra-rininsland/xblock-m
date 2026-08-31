@@ -1,0 +1,3 @@
+# Harvesting only. Scoring (--score) additionally needs the processor/
+# requirements (torch, timm, safetensors, huggingface-hub, pillow).
+aiohttp>=3.11
