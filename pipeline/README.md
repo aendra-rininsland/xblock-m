@@ -98,9 +98,17 @@ python import_corpus.py --apply
 Pulls the ImageFolder dataset in, applying the same class surgery as the training
 notebook (drop `news`, rename `altright` → `truthsocial`).
 
-**Imported labels are "at least this", not "exactly this."** The old structure
-gave nobody anywhere to record that a `twitter/` image was *also* a Bluesky
-screenshot. That matters under `BCEWithLogitsLoss`, where an unrecorded positive
+**A CID in two folders means both labels**, so every file is read rather than
+deduplicated on first sight. 37 of 1,581 distinct images are filed twice — but
+only 6 are genuine co-occurrence (0.38%). The other 31 pair a platform with
+`negative`, which is a contradiction rather than a co-occurrence (29 are
+`discord + negative`, which looks like one bulk misfile). Those import with **no
+label** and are queued for review rather than resolved by guessing which folder
+was wrong.
+
+**For the other 99.6%, labels are still "at least this", not "exactly this."**
+0.38% is the rate at which somebody bothered to file an image twice — a lower
+bound on true co-occurrence, not a measurement of it. That matters under `BCEWithLogitsLoss`, where an unrecorded positive
 becomes an explicit zero in the target — training the model to suppress the very
 co-occurrence you want it to learn.
 
