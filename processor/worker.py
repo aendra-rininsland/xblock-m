@@ -20,8 +20,8 @@ from io import BytesIO
 from PIL import Image
 from safetensors.torch import load_file
 from timm import create_model
-
-from constants import MAX_JOB_AGE_MS, THRESHOLD
+from constants import THRESHOLD
+from preprocessing import IMG_SIZE, build_transform
 from moderate import auth_client, create_label
 
 load_dotenv()
@@ -155,13 +155,12 @@ with open(config_path) as f:
 num_classes = config.get("num_classes", 13)
 model_name = "swin_s3_base_224"
 
-img_size = (224, 224)
-transform = T.Compose([
-    T.Resize(img_size),
-    T.CenterCrop(img_size),
-    T.ToTensor(),
-    T.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-])
+# Defined in preprocessing.py so the harvester cannot drift from serving.
+# The CenterCrop that used to sit here was a verified no-op: Resize with a
+# (224,224) tuple already returns exactly that size, so cropping to it was the
+# identity. Dropping it makes this match the notebook's valid_tfms exactly.
+img_size = IMG_SIZE
+transform = build_transform()
 
 
 def create_model_instance():
