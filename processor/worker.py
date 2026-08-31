@@ -20,7 +20,6 @@ from io import BytesIO
 from PIL import Image
 from safetensors.torch import load_file
 from timm import create_model
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from constants import THRESHOLD
 from moderate import auth_client, create_label
@@ -44,6 +43,10 @@ METRICS_DB = os.path.join(LOG_DIR, "metrics.db")
 
 def _init_metrics_db() -> None:
     conn = sqlite3.connect(METRICS_DB)
+    # WAL lets the dashboard read while the worker writes. Now that jobs complete
+    # orders of magnitude faster, the default rollback journal would make readers
+    # and the writer block each other ("database is locked").
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""CREATE TABLE IF NOT EXISTS jobs (
         ts REAL, images INTEGER, labels_applied INTEGER, duration REAL
     )""")
@@ -54,14 +57,15 @@ def _init_metrics_db() -> None:
 _init_metrics_db()
 
 
-def log_metric(images: int, labels_applied: int, duration: float) -> None:
+def log_metric(images: int, labels_applied: int, duration: float, errors: int = 0) -> None:
     ts = time.time()
     # JSONL kept for compatibility/backup; SQLite is what the dashboard queries.
-    entry = json.dumps({"ts": ts, "images": images, "labels_applied": labels_applied, "duration": duration})
+    entry = json.dumps({"ts": ts, "images": images, "labels_applied": labels_applied,
+                        "duration": duration, "errors": errors})
     with open(METRICS_FILE, "a") as f:
         f.write(entry + "\n")
     try:
-        conn = sqlite3.connect(METRICS_DB)
+        conn = sqlite3.connect(METRICS_DB, timeout=5)
         conn.execute("INSERT INTO jobs VALUES (?,?,?,?)", (ts, images, labels_applied, duration))
         conn.commit()
         conn.close()
@@ -117,8 +121,13 @@ def write_model_scores(image_results: list) -> None:
 torch.set_num_threads(1)
 
 NUM_WORKERS = 50
-NUM_MODEL_INSTANCES = 1
 MODEL_NAME = os.getenv("MODEL_NAME", "swin_s3_base_224-xblockm-timm")
+
+# Micro-batching. Images arrive one or two at a time from independent jobs, but a
+# GPU wants them in a batch. Requests are collected for up to INFER_BATCH_WAIT_MS
+# (or until INFER_BATCH_SIZE is reached) and run as a single forward pass.
+INFER_BATCH_SIZE = int(os.getenv("INFER_BATCH_SIZE", "16"))
+INFER_BATCH_WAIT_MS = int(os.getenv("INFER_BATCH_WAIT_MS", "25"))
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 logger.info("Using device: %s", device)
@@ -153,11 +162,79 @@ def create_model_instance():
     return model
 
 
-logger.info("Loading %d model instances...", NUM_MODEL_INSTANCES)
-model_pool: Queue = Queue()
-for _ in range(NUM_MODEL_INSTANCES):
-    model_pool.put_nowait(create_model_instance())
-logger.info("Model instances ready.")
+logger.info("Loading model...")
+# A single instance is all that is needed: the batcher below is the only caller
+# and it runs one forward pass at a time, so there is nothing to contend over.
+model = create_model_instance()
+logger.info("Model ready. batch_size=%d batch_wait=%dms", INFER_BATCH_SIZE, INFER_BATCH_WAIT_MS)
+
+
+# ── Inference batcher ─────────────────────────────────────────────────────────
+# Callers submit a single pre-processed tensor and await a future. One background
+# task collects them into batches and runs the forward pass. Crucially, nothing
+# here is held during image download — only the ~15ms of GPU work is serialised.
+
+_infer_queue: Queue | None = None
+_batcher_task: asyncio.Task | None = None
+
+
+def _decode(content: bytes) -> torch.Tensor:
+    """Blocking decode + preprocess. Runs in a worker thread."""
+    image = Image.open(BytesIO(content)).convert("RGB")
+    return transform(image)
+
+
+def _run_batch(tensors: list[torch.Tensor]):
+    """Blocking forward pass over a stacked batch. Runs in a worker thread."""
+    batch = torch.stack(tensors).to(device)
+    with torch.no_grad():
+        logits = model(batch)
+    return logits.sigmoid().cpu().numpy()
+
+
+async def _batch_loop() -> None:
+    assert _infer_queue is not None
+    loop = asyncio.get_running_loop()
+    while True:
+        # Block until there is at least one request, then top up the batch until
+        # it is full or the wait window expires, whichever comes first.
+        items = [await _infer_queue.get()]
+        deadline = loop.time() + INFER_BATCH_WAIT_MS / 1000
+        while len(items) < INFER_BATCH_SIZE:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                items.append(await asyncio.wait_for(_infer_queue.get(), remaining))
+            except asyncio.TimeoutError:
+                break
+
+        pending = [(t, f) for t, f in items if not f.done()]
+        if not pending:
+            continue
+
+        try:
+            probs = await asyncio.to_thread(_run_batch, [t for t, _ in pending])
+        except Exception as e:
+            # Every waiter must be resolved or its job hangs forever.
+            logger.error("Batch inference failed (n=%d): %s", len(pending), e)
+            for _, f in pending:
+                if not f.done():
+                    f.set_exception(e)
+            continue
+
+        for (_, f), row in zip(pending, probs):
+            if not f.done():
+                f.set_result(row)
+
+
+async def _infer(tensor: torch.Tensor):
+    """Submit one tensor for batched inference and await its scores."""
+    if _infer_queue is None:
+        raise RuntimeError("inference batcher is not running")
+    future = asyncio.get_running_loop().create_future()
+    await _infer_queue.put((tensor, future))
+    return await future
 
 
 # ── HTTP session ──────────────────────────────────────────────────────────────
@@ -208,18 +285,17 @@ async def fetch_image_bytes(url: str) -> bytes | None:
     return None
 
 
-async def process_single_image(image_url: str, model, cid: str, top_k: int = 10) -> dict:
+async def process_single_image(image_url: str, cid: str, top_k: int = 10) -> dict:
     start_time = time.time()
     content = await fetch_image_bytes(image_url)
     if content is None:
         return {"error": "download failed", "url": image_url, "blob_cid": cid, "labels": {}}
 
     try:
-        image = Image.open(BytesIO(content)).convert("RGB")
-        cuda_image = transform(image).unsqueeze(0).to(device)
-        with torch.no_grad():
-            logits = model(cuda_image)
-        probabilities = [float(e) for e in logits.sigmoid().cpu().numpy()[0]]
+        # Decode off the event loop — PIL and the torchvision transform are
+        # blocking CPU work and would otherwise stall every concurrent download.
+        tensor = await asyncio.to_thread(_decode, content)
+        probabilities = [float(e) for e in await _infer(tensor)]
         label_prob_pairs = sorted(zip(config["label_names"], probabilities), key=lambda x: x[1], reverse=True)
         return {
             "image_url": image_url,
@@ -240,50 +316,60 @@ async def process_request(job, token):
     if isinstance(input_data, dict):
         input_data = [input_data]
 
-    model = await model_pool.get()
-    try:
-        results = []
-        for data in input_data:
-            images = (
-                data.get("commit", {})
-                    .get("record", {})
-                    .get("embed", {})
-                    .get("images", [])
-            )
-            image_urls = [
-                (
-                    f"https://cdn.bsky.app/img/feed_thumbnail/plain/{data['did']}/{img['image']['ref']['$link']}@jpeg",
-                    img["image"]["ref"]["$link"],
-                )
-                for img in images
-            ]
+    # Flatten every image in the job so they all download concurrently, then
+    # regroup by post. Nothing is serialised here.
+    plan: list[tuple[int, str, str]] = []
+    for idx, data in enumerate(input_data):
+        images = (
+            data.get("commit", {})
+                .get("record", {})
+                .get("embed", {})
+                .get("images", [])
+        )
+        for img in images:
+            cid = img["image"]["ref"]["$link"]
+            url = f"https://cdn.bsky.app/img/feed_thumbnail/plain/{data['did']}/{cid}@jpeg"
+            plan.append((idx, url, cid))
 
-            image_results = []
-            if image_urls:
-                tasks = [process_single_image(url, model, cid) for url, cid in image_urls]
-                image_results = await asyncio.gather(*tasks)
-                write_model_scores(image_results)
+    flat = await asyncio.gather(*(process_single_image(url, cid) for _, url, cid in plan))
 
-            results.append({
-                "image_results": image_results,
-                "commit": data.get("commit", {}),
-                "did": data["did"],
-            })
-    finally:
-        await model_pool.put(model)
+    grouped: dict[int, list] = {idx: [] for idx in range(len(input_data))}
+    for (idx, _, _), image_result in zip(plan, flat):
+        grouped[idx].append(image_result)
+
+    results = []
+    for idx, data in enumerate(input_data):
+        image_results = grouped[idx]
+        if image_results:
+            write_model_scores(image_results)
+        results.append({
+            "image_results": image_results,
+            "commit": data.get("commit", {}),
+            "did": data["did"],
+        })
 
     labels_applied = 0
+    errors = 0
     for result in results:
+        hits = 0
         for image_result in result["image_results"]:
+            if image_result.get("error"):
+                errors += 1
             for label, score in image_result.get("labels", {}).items():
-                if label != "negative" and float(score) > THRESHOLD:
-                    await create_label(result)
-                    labels_applied += 1
+                if label != "negative" and float(score) >= THRESHOLD:
+                    hits += 1
+        # One event per post. _emit_label re-derives the full label set from the
+        # result itself, so calling it once per matching label emitted the same
+        # event several times over.
+        if hits:
+            await create_label(result)
+            labels_applied += hits
 
     duration = time.time() - start_time
     total_images = sum(len(r["image_results"]) for r in results)
-    log_metric(total_images, labels_applied, duration)
-    logger.info("job done images=%d labels=%d duration=%.2fs", total_images, labels_applied, duration)
+    log_metric(total_images, labels_applied, duration, errors)
+    logger.info("job done images=%d labels=%d errors=%d duration=%.2fs",
+                total_images, labels_applied, errors, duration)
 
     return results if len(results) > 1 else results[0]
 
@@ -291,7 +377,13 @@ async def process_request(job, token):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
+    global _infer_queue, _batcher_task
+
     await auth_client()
+
+    # Created here rather than at import time so they bind to the running loop.
+    _infer_queue = Queue()
+    _batcher_task = asyncio.create_task(_batch_loop())
 
     shutdown_event = asyncio.Event()
 
@@ -312,9 +404,15 @@ async def main():
     await shutdown_event.wait()
 
     logger.info("Closing worker...")
+    await worker.close(force=True)
+    if _batcher_task:
+        _batcher_task.cancel()
+        try:
+            await _batcher_task
+        except asyncio.CancelledError:
+            pass
     if _http_session and not _http_session.closed:
         await _http_session.close()
-    await worker.close(force=True)
     logger.info("Worker shut down cleanly.")
 
 
