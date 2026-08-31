@@ -126,6 +126,26 @@ never `human`/`done`. They stay out of the default review queue but the
 `imported (re-review)` bucket filter surfaces them, and a human label supersedes
 the imported one.
 
+## Splits
+
+```bash
+python assign_splits.py            # dry run, with a per-class report
+python assign_splits.py --apply
+```
+
+Assigned **once**, in the manifest, and **never reassigned** — that is what keeps
+a frozen evaluation set frozen as the corpus grows. The previous notebook split
+inside `train()` and pointed its test set at the whole corpus, which is why its
+`TEST AUROC 0.983` read above `valid 0.959`.
+
+Stratification is the usual greedy approximation of iterative stratification
+(labels are sets, so ordinary stratification doesn't apply), plus a floor pass:
+at 80/10/10 a six-image class rounds to 0.6 expected in each of val and test, and
+greedy assignment leaves one of them empty — which makes the class *invisible* to
+evaluation rather than merely noisy. One image per split is reserved for every
+class that can spare it. Read the per-class report; with classes this small it
+matters more than the method.
+
 ## Training from the manifest
 
 ```python
