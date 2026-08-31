@@ -126,6 +126,39 @@ never `human`/`done`. They stay out of the default review queue but the
 `imported (re-review)` bucket filter surfaces them, and a human label supersedes
 the imported one.
 
+## Importing moderation signal from Ozone
+
+```bash
+export OZONE_DB_URL=postgres://user:pass@host/ozone
+python import_ozone.py --bot-did did:plc:... --dry-run
+python import_ozone.py --bot-did did:plc:... --apply
+```
+
+Ozone holds the moderation record, not images — but `moderation_event` carries
+`subjectBlobCids`, so images are recoverable from the CDN by CID.
+
+| bucket | what it is |
+|---|---|
+| `ozone-false-positive` | a human negated a label the model applied — a confirmed FP with a moderator's judgement attached |
+| `ozone-appeal` | a report with an appeal `reasonType` — the strongest FP evidence there is |
+| `ozone-reported` | user-submitted report |
+| `ozone-human` | a moderator applied this label by hand |
+| `ozone-model` | the labeller fired; unverified |
+
+**Nothing from Ozone is written as `source='human'`** unless a human moderator
+actually did it. Model labels are the model's own predictions: training on them
+entrenches the current decision boundary instead of correcting it, and drift *is*
+a decision-boundary problem. They arrive as candidates for review.
+
+Ozone also has **almost no negatives** — everything in it either fired or was
+complained about. It is not a sample of the firehose, so `harvest.py` stays
+necessary for the corpus's largest gap.
+
+`--bot-did` is required: `createdBy` is what separates the model's own labels
+from a moderator's, and it works across the whole history. `modTool.meta.isAutomated`
+is Ozone's own field for this and `moderate.py` now sets it, but older events
+predate it.
+
 ## Splits
 
 ```bash
