@@ -20,6 +20,43 @@ SESSION_FILE = os.path.join(os.path.dirname(__file__), "session.txt")
 
 _AUTH_ERROR_CODES = {"ExpiredToken", "AuthenticationRequired", "InvalidToken"}
 
+MODEL_NAME = os.getenv("MODEL_NAME", "swin_s3_base_224-xblockm-timm")
+
+# Model class name -> the label value published to subscribers.
+#
+# Kept explicit rather than interpolated as f"{label}-screenshot" so the two can
+# be versioned independently. Renaming a class in the training set must not
+# silently change what subscribers receive: anyone filtering on the old value
+# would simply stop matching, with nothing in the logs to say why.
+#
+# None means "the model may predict this, but nothing is published".
+LABEL_VALUES: dict[str, str | None] = {
+    # `altright` was renamed to `truthsocial` in the training set -- it is a
+    # platform class (Truth Social's UI), not an ideological judgement. The
+    # published value stays the legacy one until subscribers have migrated;
+    # flip it to "truthsocial-screenshot" once they have.
+    "truthsocial": "altright-screenshot",
+    "bluesky":     "bluesky-screenshot",
+    "discord":     "discord-screenshot",
+    "facebook":    "facebook-screenshot",
+    "fediverse":   "fediverse-screenshot",
+    "instagram":   "instagram-screenshot",
+    "ngl":         "ngl-screenshot",
+    "reddit":      "reddit-screenshot",
+    "threads":     "threads-screenshot",
+    "tumblr":      "tumblr-screenshot",
+    "twitter":     "twitter-screenshot",
+
+    # "not a screenshot" is the absence of a label, never a label of its own.
+    "negative":    None,
+
+    # Retired classes. Retained so that rolling back to an older checkpoint
+    # cannot start publishing something unexpected.
+    "altright":    "altright-screenshot",
+    "news":        None,
+    "newsmedia":   None,
+}
+
 
 def _make_client() -> AsyncClient:
     c = AsyncClient()
@@ -115,12 +152,26 @@ async def _emit_label(result: dict) -> None:
     add_labels = []
     for image in result["image_results"]:
         for label, score in image.get("labels", {}).items():
-            if float(score) >= THRESHOLD:
-                if label in ("news", "newsmedia"):
-                    pass
-                elif label != "negative":
-                    add_labels.append(f"{label}-screenshot")
-                    blob_cids.append(image["blob_cid"])
+            if float(score) < THRESHOLD:
+                continue
+            if label not in LABEL_VALUES:
+                # A checkpoint predicting a class the serving side has never
+                # heard of. Refuse to invent a label value for it.
+                logger.warning(
+                    "Model class %r is not in LABEL_VALUES; not publishing. "
+                    "Add it there if it should be.", label
+                )
+                continue
+            value = LABEL_VALUES[label]
+            if value is None:
+                continue
+            add_labels.append(value)
+            blob_cids.append(image["blob_cid"])
+
+    # Several images in one post can fire the same class; publish each value and
+    # each blob once.
+    add_labels = list(dict.fromkeys(add_labels))
+    blob_cids = list(dict.fromkeys(blob_cids))
 
     if not add_labels:
         return
@@ -130,7 +181,7 @@ async def _emit_label(result: dict) -> None:
             "$type": "tools.ozone.moderation.defs#modEventLabel",
             "createLabelVals": add_labels,
             "negateLabelVals": [],
-            "comment": "model:howdyaendra/swin_s3_base_224-xblockm-timm",
+            "comment": f"model:howdyaendra/{MODEL_NAME}",
         },
         "subject": {
             "$type": "com.atproto.repo.strongRef",
