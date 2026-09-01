@@ -82,6 +82,39 @@ def resolve_classes(original: list[str]) -> tuple[list[str], dict[int, str]]:
     return kept, mapping
 
 
+def image_bytes_and_path(blob) -> tuple[bytes | None, str]:
+    """Get the encoded bytes out of a datasets Image cell, whatever shape it is.
+
+    `datasets` returns different things depending on version and on how the
+    dataset was materialised, and Image(decode=False) does not normalise them:
+
+      {"bytes": b"...", "path": None}   embedded bytes
+      {"bytes": None, "path": "/..."}   a file REFERENCE into the hub cache
+                                        -- what datasets 5.x gives for an
+                                        imagefolder, and what broke this import
+      PIL.Image                          decode=False ignored / older versions
+
+    Reading only ["bytes"] therefore works on one machine and silently imports
+    nothing on another.
+    """
+    if isinstance(blob, dict):
+        raw = blob.get("bytes")
+        path = blob.get("path") or ""
+        if raw:
+            return raw, path
+        if path and Path(path).is_file():
+            return Path(path).read_bytes(), path
+        return None, path
+    if hasattr(blob, "save"):
+        # A decoded image. Re-encoding changes the bytes, so the filename CID no
+        # longer describes them and the content hash is used instead.
+        import io
+        buf = io.BytesIO()
+        blob.convert("RGB").save(buf, "JPEG", quality=95)
+        return buf.getvalue(), ""
+    return None, ""
+
+
 def cid_from_filename(path: str) -> str | None:
     """The corpus is named by blob CID (`altright/bafkrei....jpeg`), so imported
     images share an identity with harvested ones and deduplicate against them."""
@@ -188,14 +221,13 @@ def main() -> None:
             skipped_dropped += 1
             continue
 
-        blob = row["image"]
-        raw, path = blob["bytes"], blob.get("path") or ""
-        cid = cid_from_filename(path)
-        if cid is None:
-            if not raw:
-                skipped_nocid += 1
-                continue
-            cid = "sha256" + hashlib.sha256(raw).hexdigest()[:40]
+        raw, path = image_bytes_and_path(row["image"])
+        if raw is None:
+            skipped_nocid += 1
+            continue
+        # Prefer the blob CID from the filename so imports deduplicate against
+        # harvested copies; fall back to a content hash.
+        cid = cid_from_filename(path) or "sha256" + hashlib.sha256(raw).hexdigest()[:40]
 
         labels_by_cid.setdefault(cid, set()).add(label_name)
         if raw and cid not in bytes_by_cid:
@@ -257,7 +289,10 @@ def main() -> None:
     for name in sorted(counts, key=lambda n: -counts[n]):
         print(f"  {name:<14}{counts[name]:>6,}")
     print(f"\nskipped: {skipped_dropped:,} dropped-class files, "
-          f"{skipped_existing:,} already present, {skipped_nocid:,} unidentifiable")
+          f"{skipped_existing:,} already present, {skipped_nocid:,} without readable bytes")
+    if skipped_nocid:
+        print("  A dataset row gave neither embedded bytes nor a readable file path.")
+        print("  Check `datasets` version and that the hub cache is intact.")
 
     print(f"\nmulti-label (filed in two folders): {len(multi)}")
     for cid, ls in multi:
@@ -278,11 +313,13 @@ def main() -> None:
         print("  'not a screenshot', so it cannot hold alongside a platform label.")
     if not args.apply:
         print("\ndry run -- re-run with --apply to write")
-    else:
+    elif imported:
         print(f"\nlabels written with source='{SOURCE}', review_state='{IMPORTED}'.")
         print("These are 'at least' labels. Re-review with the `imported` bucket "
               "filter, then `python dataset.py --co-occurrence` to see how often a "
               "second label gets added.")
+    else:
+        print("\nnothing was imported, so nothing was written.")
 
 
 if __name__ == "__main__":
