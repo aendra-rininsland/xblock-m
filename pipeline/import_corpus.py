@@ -168,6 +168,78 @@ def resolve_labels(cid: str, labels: set[str],
     return set(labels), SOURCE, IMPORTED, ("multi" if len(labels) > 1 else "single")
 
 
+def fix_cids(db: str, images: str, dataset: str, apply: bool) -> None:
+    """Rewrite content-hash ids to real blob cids, in place.
+
+    An import that ran while `datasets` was hiding the filename produced
+    "sha256..." ids. Those never match an Ozone event, never deduplicate against
+    a harvested copy, and never match conflict_resolutions.json.
+
+    The blob cid is not recoverable from the stored bytes -- the corpus holds CDN
+    renditions, not the original blobs -- but it IS recoverable by re-deriving
+    the same fallback key from the snapshot and mapping it back to the filename.
+    Rewriting in place preserves splits, review state and sweep decisions, all of
+    which a delete-and-reimport would destroy.
+    """
+    from huggingface_hub import snapshot_download
+
+    conn = connect(db)
+    stale = [r[0] for r in conn.execute(
+        "SELECT cid FROM images WHERE cid LIKE 'sha256%'")]
+    print(f"content-hash ids in the manifest: {len(stale):,}")
+    if not stale:
+        print("nothing to fix")
+        return
+
+    print(f"fetching {dataset} to rebuild the mapping ...")
+    root = Path(snapshot_download(dataset, repo_type="dataset"))
+    mapping: dict[str, str] = {}
+    for f in root.rglob("*"):
+        if f.is_file() and f.suffix.lower() in (".jpeg", ".jpg", ".png"):
+            key = "sha256" + hashlib.sha256(f.read_bytes()).hexdigest()[:40]
+            mapping[key] = f.stem
+
+    resolvable = [c for c in stale if c in mapping]
+    print(f"  mapped to a blob cid: {len(resolvable):,}")
+    print(f"  unmappable:           {len(stale) - len(resolvable):,}")
+    if not apply:
+        print("\ndry run -- re-run with --apply to rewrite")
+        return
+
+    images_root = Path(images)
+    existing = {r[0] for r in conn.execute("SELECT cid FROM images")}
+    renamed = merged = 0
+    for old in resolvable:
+        new = mapping[old]
+        old_file, new_file = image_path(images_root, old), image_path(images_root, new)
+        if new in existing:
+            # A harvested copy of the same blob is already here. Move the label
+            # and review state onto it rather than keeping two identities.
+            for table, col in (("labels", "cid"), ("review_state", "cid")):
+                conn.execute(f"UPDATE OR IGNORE {table} SET {col}=? WHERE {col}=?", (new, old))
+            for table, col in (("labels", "cid"), ("review_state", "cid"),
+                               ("splits", "cid"), ("images", "cid")):
+                conn.execute(f"DELETE FROM {table} WHERE {col}=?", (old,))
+            old_file.unlink(missing_ok=True)
+            merged += 1
+            continue
+        new_file.parent.mkdir(parents=True, exist_ok=True)
+        if old_file.is_file():
+            old_file.replace(new_file)
+        for table, col in (("labels", "cid"), ("review_state", "cid"),
+                           ("splits", "cid"), ("model_scores", "image_cid")):
+            conn.execute(f"UPDATE {table} SET {col}=? WHERE {col}=?", (new, old))
+        conn.execute("UPDATE images SET cid=?, path=? WHERE cid=?",
+                     (new, str(new_file.relative_to(images_root)), old))
+        existing.add(new)
+        renamed += 1
+    conn.commit()
+    conn.close()
+    print(f"\nrewritten {renamed:,}   merged into an existing harvested copy {merged:,}")
+    print("Splits and review state were carried across. Now run:")
+    print("  python import_corpus.py --resolve-only --apply")
+
+
 def apply_resolutions(db: str, images: str, apply: bool) -> None:
     """Apply conflict_resolutions.json to images already in the manifest.
 
@@ -236,6 +308,8 @@ def main() -> None:
     p.add_argument("--dry-run", action="store_true",
                    help="report without writing (this is the default)")
     p.add_argument("--apply", action="store_true", help="write (default is a dry run)")
+    p.add_argument("--fix-cids", action="store_true",
+                   help="rewrite content-hash ids to real blob cids, in place")
     p.add_argument("--resolve-only", action="store_true",
                    help="apply conflict_resolutions.json to images already imported, "
                         "without re-importing the corpus")
@@ -244,23 +318,40 @@ def main() -> None:
     if args.dry_run and args.apply:
         sys.exit("--dry-run and --apply are contradictory; a dry run is the default")
 
+    if args.fix_cids:
+        fix_cids(args.db, args.images, args.dataset, args.apply)
+        return
+
     if args.resolve_only:
         apply_resolutions(args.db, args.images, args.apply)
         return
 
     try:
-        import datasets
+        from huggingface_hub import snapshot_download
     except ImportError:
-        sys.exit("pip install datasets")
+        sys.exit("pip install huggingface_hub")
 
-    print(f"loading {args.dataset} ...")
-    ds = datasets.load_dataset(args.dataset, split="train")
-    # decode=False keeps the original encoded bytes. Re-encoding through PIL
-    # would change the bytes and make the filename CID a lie.
-    ds = ds.cast_column("image", datasets.Image(decode=False))
+    # Read the repository directly rather than through `datasets`.
+    #
+    # datasets returns the Image column in different shapes depending on version
+    # -- embedded bytes with no path, or a path with no bytes -- and the FILENAME
+    # is the only place the blob CID exists. It cannot be recovered from the
+    # bytes: the corpus files are CDN renditions, so their content hash is not
+    # the blob's CID. A version that hides the path therefore silently produces
+    # content-hash ids, which never match Ozone events, never deduplicate against
+    # harvested images, and never match conflict_resolutions.json.
+    #
+    # Walking the snapshot has no such ambiguity: directory name is the class,
+    # file stem is the blob CID.
+    print(f"fetching {args.dataset} ...")
+    root = Path(snapshot_download(args.dataset, repo_type="dataset"))
+    files = sorted(f for f in root.rglob("*")
+                   if f.is_file() and f.suffix.lower() in (".jpeg", ".jpg", ".png"))
+    if not files:
+        sys.exit(f"no image files under {root}")
 
-    original = ds.features["label"].names
-    kept, mapping = resolve_classes(original)
+    original = sorted({f.parent.name for f in files})
+    kept, _ = resolve_classes(original)
     unknown = set(kept) - set(CLASSES)
     if unknown:
         sys.exit(f"corpus has classes the manifest does not know: {sorted(unknown)}")
@@ -275,28 +366,23 @@ def main() -> None:
     now = datetime.now(timezone.utc).isoformat()
 
     # Pass 1: collect the label SET per CID. A CID in two folders carries both
-    # labels, so deduplicating on first sight would silently drop the second.
+    # labels, so keying by cid rather than by file is what preserves that.
     labels_by_cid: dict[str, set[str]] = {}
-    bytes_by_cid: dict[str, bytes] = {}
+    paths_by_cid: dict[str, Path] = {}
     skipped_dropped = skipped_nocid = 0
 
-    for row in ds:
-        label_name = mapping.get(row["label"])
-        if label_name is None:
+    for f in files:
+        cls = f.parent.name
+        if cls in DROP_CLASSES:
             skipped_dropped += 1
             continue
-
-        raw, path = image_bytes_and_path(row["image"])
-        if raw is None:
+        label_name = RENAME_CLASSES.get(cls, cls)
+        cid = cid_from_filename(f.name)
+        if cid is None:
             skipped_nocid += 1
             continue
-        # Prefer the blob CID from the filename so imports deduplicate against
-        # harvested copies; fall back to a content hash.
-        cid = cid_from_filename(path) or "sha256" + hashlib.sha256(raw).hexdigest()[:40]
-
         labels_by_cid.setdefault(cid, set()).add(label_name)
-        if raw and cid not in bytes_by_cid:
-            bytes_by_cid[cid] = raw
+        paths_by_cid.setdefault(cid, f)
 
     # Pass 2: resolve and write.
     counts: dict[str, int] = {}
@@ -323,7 +409,8 @@ def main() -> None:
         if args.apply:
             dest = image_path(images_root, cid)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            raw = bytes_by_cid.get(cid)
+            src = paths_by_cid.get(cid)
+            raw = src.read_bytes() if src else None
             if raw:
                 dest.write_bytes(raw)
             conn.execute(
@@ -354,10 +441,9 @@ def main() -> None:
     for name in sorted(counts, key=lambda n: -counts[n]):
         print(f"  {name:<14}{counts[name]:>6,}")
     print(f"\nskipped: {skipped_dropped:,} dropped-class files, "
-          f"{skipped_existing:,} already present, {skipped_nocid:,} without readable bytes")
+          f"{skipped_existing:,} already present, {skipped_nocid:,} without a blob cid")
     if skipped_nocid:
-        print("  A dataset row gave neither embedded bytes nor a readable file path.")
-        print("  Check `datasets` version and that the hub cache is intact.")
+        print("  A file was not named after a blob cid -- check the corpus layout.")
 
     print(f"\nmulti-label (filed in two folders): {len(multi)}")
     for cid, ls in multi:
