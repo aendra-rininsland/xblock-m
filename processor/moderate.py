@@ -8,6 +8,7 @@ from atproto_client.exceptions import BadRequestError, UnauthorizedError
 from dotenv import load_dotenv
 
 from constants import THRESHOLD
+from label_values import LABEL_VALUES
 
 load_dotenv()
 
@@ -19,6 +20,23 @@ _auth_lock = asyncio.Lock()
 SESSION_FILE = os.path.join(os.path.dirname(__file__), "session.txt")
 
 _AUTH_ERROR_CODES = {"ExpiredToken", "AuthenticationRequired", "InvalidToken"}
+
+MODEL_NAME = os.getenv("MODEL_NAME", "swin_s3_base_224-xblockm-timm")
+
+# Ozone's own field for "where did this action come from". report.isAutomated is
+# denormalised from modTool.meta.isAutomated, so without this Ozone cannot tell
+# the labeller's events apart from a human moderator's, its UI cannot filter
+# them, and anything reading isAutomated downstream is simply wrong. The model
+# name is also in `comment` for readability in the mod log, but that is an
+# unstructured string; this is the field designed for it.
+MOD_TOOL = {
+    "name": "xblock",
+    "meta": {
+        "isAutomated": True,
+        "model": f"howdyaendra/{MODEL_NAME}",
+        "threshold": THRESHOLD,
+    },
+}
 
 
 def _make_client() -> AsyncClient:
@@ -115,12 +133,26 @@ async def _emit_label(result: dict) -> None:
     add_labels = []
     for image in result["image_results"]:
         for label, score in image.get("labels", {}).items():
-            if float(score) >= THRESHOLD:
-                if label in ("news", "newsmedia"):
-                    pass
-                elif label != "negative":
-                    add_labels.append(f"{label}-screenshot")
-                    blob_cids.append(image["blob_cid"])
+            if float(score) < THRESHOLD:
+                continue
+            if label not in LABEL_VALUES:
+                # A checkpoint predicting a class the serving side has never
+                # heard of. Refuse to invent a label value for it.
+                logger.warning(
+                    "Model class %r is not in LABEL_VALUES; not publishing. "
+                    "Add it there if it should be.", label
+                )
+                continue
+            value = LABEL_VALUES[label]
+            if value is None:
+                continue
+            add_labels.append(value)
+            blob_cids.append(image["blob_cid"])
+
+    # Several images in one post can fire the same class; publish each value and
+    # each blob once.
+    add_labels = list(dict.fromkeys(add_labels))
+    blob_cids = list(dict.fromkeys(blob_cids))
 
     if not add_labels:
         return
@@ -130,7 +162,7 @@ async def _emit_label(result: dict) -> None:
             "$type": "tools.ozone.moderation.defs#modEventLabel",
             "createLabelVals": add_labels,
             "negateLabelVals": [],
-            "comment": "model:howdyaendra/swin_s3_base_224-xblockm-timm",
+            "comment": f"model:howdyaendra/{MODEL_NAME}",
         },
         "subject": {
             "$type": "com.atproto.repo.strongRef",
@@ -140,6 +172,8 @@ async def _emit_label(result: dict) -> None:
         "createdBy": client._session.did,
         "createdAt": datetime.datetime.now().isoformat(),
         "subjectBlobCids": blob_cids,
+        # Top-level, sibling to `event` -- see tools.ozone.moderation.emitEvent.
+        "modTool": MOD_TOOL,
     }
 
     logger.debug("Emitting labels %s for %s", add_labels, uri)
