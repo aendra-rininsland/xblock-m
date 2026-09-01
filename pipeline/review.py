@@ -34,7 +34,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from manifest import (CLASSES, DONE, NEEDS_DETAIL, NEGATIVE, PENDING,
+from manifest import (CLASSES, DONE, IMPORTED, NEEDS_DETAIL, NEGATIVE, PENDING,
                       PLATFORM_CLASSES, SKIPPED, connect, image_path)
 
 app = FastAPI(title="xblock review")
@@ -101,8 +101,13 @@ async def queue(mode: str = "sweep", bucket: str = "", limit: int = 60):
     detail -> whatever the sweep flagged, then anything still pending
     """
     conn = db()
-    where = ["i.cid NOT IN (SELECT cid FROM review_state WHERE state IN (?,?))"]
-    params: list = [DONE, SKIPPED]
+    # Imported ImageFolder rows already carry a label, so they stay out of the
+    # default queue -- but selecting their bucket explicitly is how the
+    # re-review pass surfaces them.
+    hidden = [DONE, SKIPPED] if bucket else [DONE, SKIPPED, IMPORTED]
+    where = [f"i.cid NOT IN (SELECT cid FROM review_state WHERE state IN "
+             f"({','.join('?' * len(hidden))}))"]
+    params: list = [*hidden]
     if bucket:
         where.append("i.bucket = ?")
         params.append(bucket)
@@ -128,8 +133,13 @@ async def queue(mode: str = "sweep", bucket: str = "", limit: int = 60):
         scores = json.loads(r["all_scores"]) if r["all_scores"] else None
         if scores:
             scores = dict(sorted(scores.items(), key=lambda kv: -kv[1])[:4])
+        # Existing labels come back so the UI can pre-select them. Review of an
+        # already-labelled image is additive -- confirming a second platform --
+        # not re-entry from scratch.
+        labels = [x[0] for x in conn.execute(
+            "SELECT label FROM labels WHERE cid = ?", (r["cid"],))]
         items.append({"cid": r["cid"], "bucket": r["bucket"], "post_uri": r["post_uri"],
-                      "state": r["state"], "scores": scores})
+                      "state": r["state"], "scores": scores, "labels": sorted(set(labels))})
     conn.close()
     return {"items": items}
 

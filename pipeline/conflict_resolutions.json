@@ -1,0 +1,101 @@
+{
+  "_comment": [
+    "Human resolutions for CIDs filed under two mutually exclusive folders in",
+    "howdyaendra/xblock-social-screenshots. `negative` means the image is not a",
+    "screenshot of a post, so it cannot hold alongside a platform label.",
+    "Reviewed by aendra, 2026-09-01. These resolved the discord-vs-negative",
+    "question specifically; they are not an exhaustive multi-label pass, so an",
+    "image here may still gain a second platform label on re-review."
+  ],
+  "resolved_by": "aendra",
+  "resolved_at": "2026-09-01",
+  "resolutions": {
+    "bafkreiahjg3mm6kbpidtlbtariir6txnggvcoz7jbct4pnqz65xltij3ky": [
+      "discord"
+    ],
+    "bafkreiamfzrnefkb7z5xiyyonbufjm2sqpt2ba5cipzgkujd7rlbbhzhgy": [
+      "discord"
+    ],
+    "bafkreiapc2c2ly4r53wik6immxiq5d5zgdl73qe7wtc4hrud5fhd34l4se": [
+      "discord"
+    ],
+    "bafkreibjbbwl2bdafky5ygfjagd7capweazm6c4qy4rsuxda2msuw5fb54": [
+      "discord"
+    ],
+    "bafkreibvxpl3hv5s2sn4kp2jg7nxnsgqbe437g2yreikdfotuqnymonz5m": [
+      "discord"
+    ],
+    "bafkreic6exislwp7citfwfmeuhbeoncy3ue2lyr554taf3pik2ltnce544": [
+      "negative"
+    ],
+    "bafkreicd7ji3j7kfobzv3j7bugplz44q3n3and7mq43labsfq35x57ulam": [
+      "discord"
+    ],
+    "bafkreiciifgx6awul5kkvrgg7rq6hmdmbtipmfukj4c3wrsvlqw3tko6dy": [
+      "discord"
+    ],
+    "bafkreicm3ozn27jjmgirn5r75ha344ifqbud4fouunzstkyyhshvzug5zu": [
+      "discord"
+    ],
+    "bafkreicqpn5ufkyfbtj2aonjc4wwmxjn3sqdl7axgknpkig4mqq5zlwwqu": [
+      "discord"
+    ],
+    "bafkreid3fqynrddppkyrzzwnrtjfaldndjueqw2fxuhpmcjmock3j6uoiy": [
+      "negative"
+    ],
+    "bafkreidch6zwyf7mamu7ivxpkop3b56y5uoke42xkkbdue7sshy7cwltki": [
+      "discord"
+    ],
+    "bafkreiddrlbg4wesvzd2frqlgbkzn7egyb6hvuxut5lkddqyzsjb5ho7s4": [
+      "discord"
+    ],
+    "bafkreidf62fdqwtt6yc5iwl6baauhl3ph3djpen5y7y3sg3sftc3a652fe": [
+      "discord"
+    ],
+    "bafkreidgjhyejb6czxjbnuqnigxihuk7f2khtykrzsutcy2hlp74tesh4u": [
+      "discord"
+    ],
+    "bafkreidwfixsx7rvfg3vwdacz4gjfzbsjwfdhvnxqh6plc55x3p4uuxfmm": [
+      "discord"
+    ],
+    "bafkreie66vzzvulywzniuuyqic7vbd2wwouzomm7mg6ludkbd7hvu2iumi": [
+      "discord"
+    ],
+    "bafkreieicuqira6fuaoi5txmecdhvxrgizm3sepjwcja2sah5wuzhdrtqu": [
+      "discord"
+    ],
+    "bafkreiekeb5l347byudtq5bwna2yefmq3hvl75rprqzs6jzh3npj2diwdy": [
+      "discord"
+    ],
+    "bafkreif2atbltwotmklz6wd3wnwqs3bcy6mzgvsflrid4qgaz4ux6gh43e": [
+      "discord"
+    ],
+    "bafkreifc6pr4ufztxwrm775q7ve2quxcdoxtcsinb4fg6tkilyy2qeej3i": [
+      "discord"
+    ],
+    "bafkreifl5pxhj5dcuhojv4ycdcuawvnq2xegw23tdzteh7kglvyxrmv7gm": [
+      "discord"
+    ],
+    "bafkreifwmbkywn3lhlswmx5owhxnw42qpj653dmfoxvh5s23bfftzbm4ze": [
+      "discord"
+    ],
+    "bafkreigaomtugmjrb4nnzxnuixxahxsvsaxovoptjayks5qgwk7fb22bti": [
+      "discord"
+    ],
+    "bafkreih65mr4jbyutmihkbqv3go6aotxevhtgq3kbrudlrjco6u55f7xpy": [
+      "discord"
+    ],
+    "bafkreihcqpb6hdvtaegt37k63aug2tlfefgn6hy36urf2j2b53bgb4zcw4": [
+      "discord"
+    ],
+    "bafkreihofwcklfjvkgocns5ohv5ermveguqw7mcgvbp3ffhqgbbj2zjtoy": [
+      "discord"
+    ],
+    "bafkreihqhnjgu44dznrk25w7sxra2ebyisonc5rfwmpcglzhj3ovp6mlvu": [
+      "discord"
+    ],
+    "bafkreihx3xvn7a4o2mm7pelxig3g6al54ck4gqelckbausk4h7betuhi4u": [
+      "discord"
+    ]
+  }
+}
