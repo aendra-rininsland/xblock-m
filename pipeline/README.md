@@ -91,7 +91,10 @@ python review.py --db data/pipeline.db --images data/images
 
 Two modes, because the work has two shapes:
 
-**Sweep** — a grid of thumbnails. Click the few that *are* screenshots; everything
+**Sweep** — a grid of thumbnails, in portrait cells because screenshots are tall.
+Press `f` (or the Fill/Whole button) to switch between a cropped-but-dense grid
+and whole images letterboxed, and **hover any thumbnail to see it uncropped** —
+platform tells often sit in the bottom nav bar, which a crop removes entirely. Click the few that *are* screenshots; everything
 left unclicked is recorded as `negative` on submit. This is how ~3,000 negatives
 get labelled in well under an hour. Thumbnails are top-anchored rather than
 centre-cropped: platform chrome lives along the top edge, and centre-cropping a
