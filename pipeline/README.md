@@ -188,6 +188,19 @@ from a moderator's, and it works across the whole history. `modTool.meta.isAutom
 is Ozone's own field for this and `moderate.py` now sets it, but older events
 predate it.
 
+### Applying decisions after the fact
+
+```bash
+python import_corpus.py --resolve-only            # dry run
+python import_corpus.py --resolve-only --apply
+```
+
+A conflict imported before its decision was recorded — or before
+`conflict_resolutions.json` reached the checkout — sits in `needs-detail` with no
+label. **Re-importing will not fix it**: those cids are already present and get
+skipped as `already present`. This applies the recorded decisions in place, then
+re-run `assign_splits.py --apply` to give the newly-labelled images a split.
+
 ## Splits
 
 ```bash

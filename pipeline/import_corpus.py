@@ -168,6 +168,64 @@ def resolve_labels(cid: str, labels: set[str],
     return set(labels), SOURCE, IMPORTED, ("multi" if len(labels) > 1 else "single")
 
 
+def apply_resolutions(db: str, images: str, apply: bool) -> None:
+    """Apply conflict_resolutions.json to images already in the manifest.
+
+    A conflict imported before its decision was recorded -- or before the
+    decisions file reached the checkout -- sits in needs-detail with no label.
+    Re-importing will not fix it: those cids are already present and get skipped.
+    This applies the recorded decisions in place.
+    """
+    resolutions = load_resolutions()
+    if not resolutions:
+        sys.exit(f"no resolutions found at {RESOLUTIONS_FILE}")
+
+    conn = connect(db)
+    now = datetime.now(timezone.utc).isoformat()
+    present = {r[0] for r in conn.execute("SELECT cid FROM images")}
+    already = {r[0] for r in conn.execute(
+        "SELECT DISTINCT cid FROM labels WHERE source IN (?, ?)", (HUMAN, SOURCE))}
+
+    todo = {c: l for c, l in resolutions.items() if c in present and c not in already}
+    missing = [c for c in resolutions if c not in present]
+    done = [c for c in resolutions if c in already]
+
+    print(f"resolutions on file  {len(resolutions):,}")
+    print(f"  already labelled   {len(done):,}")
+    print(f"  not in manifest    {len(missing):,}")
+    print(f"  to apply           {len(todo):,}")
+    if todo:
+        counts: dict[str, int] = {}
+        for labels in todo.values():
+            for l in labels:
+                counts[l] = counts.get(l, 0) + 1
+        for name in sorted(counts, key=lambda n: -counts[n]):
+            print(f"    {name:<14}{counts[name]:>5}")
+
+    if not todo:
+        print("\nnothing to do")
+        return
+    if not apply:
+        print("\ndry run -- re-run with --apply to write")
+        return
+
+    for cid, labels in todo.items():
+        for label in labels:
+            conn.execute(
+                "INSERT OR REPLACE INTO labels (cid,label,source,created_at)"
+                " VALUES (?,?,?,?)", (cid, label, HUMAN, now))
+        # IMPORTED, not DONE: the decision settled which of two contradictory
+        # folders was right and said nothing about a second platform, so the
+        # image stays re-reviewable.
+        conn.execute(
+            "INSERT INTO review_state (cid,state,updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(cid) DO UPDATE SET state=excluded.state",
+            (cid, IMPORTED, now))
+    conn.commit()
+    conn.close()
+    print(f"\napplied {len(todo):,}. Re-run assign_splits.py --apply to give them a split.")
+
+
 def main() -> None:
     here = Path(__file__).parent
     p = argparse.ArgumentParser(description=__doc__,
@@ -178,10 +236,17 @@ def main() -> None:
     p.add_argument("--dry-run", action="store_true",
                    help="report without writing (this is the default)")
     p.add_argument("--apply", action="store_true", help="write (default is a dry run)")
+    p.add_argument("--resolve-only", action="store_true",
+                   help="apply conflict_resolutions.json to images already imported, "
+                        "without re-importing the corpus")
     args = p.parse_args()
 
     if args.dry_run and args.apply:
         sys.exit("--dry-run and --apply are contradictory; a dry run is the default")
+
+    if args.resolve_only:
+        apply_resolutions(args.db, args.images, args.apply)
+        return
 
     try:
         import datasets
