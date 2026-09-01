@@ -268,6 +268,30 @@ co-occur**, so this reports coverage: which pairs have been observed, and which
 classes have no co-occurrence example at all. Those can only ever be predicted
 alone, and the `multi-candidate` harvest bucket targets exactly that gap.
 
+## Evaluating a checkpoint
+
+```bash
+python evaluate.py --weights ./swin_s3_base_224-xblockm-timm --json baseline.json
+python evaluate.py --weights ./retrained --json new.json
+python evaluate.py --compare baseline.json new.json
+```
+
+Two models are only comparable if they were measured on **the same images**. The
+notebook reports metrics for the model it just trained against whatever the split
+table said at that moment, so a run from before the corpus grew cannot be
+compared with one from after — both print a "TEST AUROC" and the numbers mean
+different things.
+
+This scores any checkpoint against the split as it stands now, so an old model
+and a new one land on the same footing. Preprocessing comes from
+`processor/preprocessing.py`, the same module the serving worker uses, so an
+evaluation cannot measure something the deployed model would never see.
+
+It also reports **the share of true negatives that fire on any platform class** —
+the closest thing to a production false-positive rate the split can give. Note it
+is optimistic: the test split is ~4x negative where production is ~27x, so the
+real rate is several times higher.
+
 ## Schema
 
 - `images` — one row per distinct image. `cid` is a content hash, so byte-identical
