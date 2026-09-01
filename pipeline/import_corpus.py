@@ -55,7 +55,8 @@ from pathlib import Path
 from collections import Counter
 
 from manifest import (CLASSES, IMPORTED, NEEDS_DETAIL, NEGATIVE, connect,
-                      image_path)
+                      image_path, default_db,
+                      default_images)
 
 HF_DATASET = "howdyaendra/xblock-social-screenshots"
 SOURCE = "imagefolder-v1"
@@ -138,8 +139,8 @@ def main() -> None:
     here = Path(__file__).parent
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--db", default=str(here / "data" / "pipeline.db"))
-    p.add_argument("--images", default=str(here / "data" / "images"))
+    p.add_argument("--db", default=default_db())
+    p.add_argument("--images", default=default_images())
     p.add_argument("--dataset", default=HF_DATASET)
     p.add_argument("--dry-run", action="store_true",
                    help="report without writing (this is the default)")

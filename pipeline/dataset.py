@@ -36,7 +36,7 @@ import sqlite3
 from collections import Counter
 from pathlib import Path
 
-from manifest import CLASSES, connect, image_path
+from manifest import CLASSES, connect, image_path, default_db, default_images
 
 HUMAN = "human"
 IMPORTED_SOURCE = "imagefolder-v1"
@@ -135,8 +135,8 @@ def main() -> None:
     here = Path(__file__).parent
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--db", default=str(here / "data" / "pipeline.db"))
-    p.add_argument("--images", default=str(here / "data" / "images"))
+    p.add_argument("--db", default=default_db())
+    p.add_argument("--images", default=default_images())
     p.add_argument("--co-occurrence", action="store_true",
                    help="report how often an image carries more than one label")
     args = p.parse_args()
