@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XBlock Review</title>
+<style>
+  /* Shares the dashboard's palette so the two internal tools read as one system. */
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --surface-2: #222634; --border: #2a2d3e;
+    --text: #e2e8f0; --muted: #64748b; --accent: #6366f1;
+    --green: #22c55e; --yellow: #eab308; --red: #ef4444;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text);
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         font-size: 14px; }
+  header { display: flex; align-items: center; gap: 20px; padding: 12px 20px;
+           border-bottom: 1px solid var(--border); position: sticky; top: 0;
+           background: var(--bg); z-index: 10; }
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: -.3px; white-space: nowrap; }
+  .modes { display: flex; gap: 4px; }
+  .modes button { padding: 5px 12px; font-size: 12px; font-weight: 500;
+                  border-radius: 6px; border: 1px solid var(--border);
+                  background: var(--surface); color: var(--muted); cursor: pointer; }
+  .modes button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  select { background: var(--surface); color: var(--text); border: 1px solid var(--border);
+           border-radius: 6px; padding: 5px 8px; font-size: 12px; }
+  .spacer { flex: 1; }
+  .counts { display: flex; gap: 16px; font-size: 12px; color: var(--muted);
+            font-variant-numeric: tabular-nums; }
+  .counts b { color: var(--text); font-weight: 600; }
+  .ratio.bad { color: var(--red); } .ratio.ok { color: var(--green); }
+
+  main { padding: 16px 20px 90px; }
+
+  /* ── sweep ── */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+          gap: 8px; }
+  .cell { position: relative; aspect-ratio: 1; border-radius: 6px; overflow: hidden;
+          border: 2px solid var(--border); cursor: pointer; background: var(--surface); }
+  /* Anchor to the top: screenshots are tall, and the platform chrome along the
+     top edge is the single most diagnostic region. Centre-cropping a phone
+     screenshot to a square throws away exactly the part being judged. */
+  .cell img { width: 100%; height: 100%; object-fit: cover; object-position: top;
+              display: block; }
+  .cell.on { border-color: var(--yellow); }
+  .cell.on::after { content: "screenshot"; position: absolute; inset: auto 0 0 0;
+                    background: var(--yellow); color: #000; font-size: 10px;
+                    font-weight: 700; text-align: center; padding: 3px;
+                    text-transform: uppercase; letter-spacing: .05em; }
+  .cell .idx { position: absolute; top: 4px; left: 4px; background: rgba(0,0,0,.7);
+               color: #fff; font-size: 10px; padding: 1px 5px; border-radius: 3px;
+               font-variant-numeric: tabular-nums; }
+
+  /* ── detail ── */
+  .detail { display: grid; grid-template-columns: minmax(0,1fr) 300px; gap: 20px;
+            align-items: start; }
+  .stage { background: var(--surface); border: 1px solid var(--border);
+           border-radius: 10px; padding: 12px; display: flex; justify-content: center; }
+  .stage img { max-width: 100%; max-height: 74vh; border-radius: 6px; }
+  .side { display: flex; flex-direction: column; gap: 14px; }
+  .card { background: var(--surface); border: 1px solid var(--border);
+          border-radius: 10px; padding: 14px; }
+  .card h2 { font-size: 11px; font-weight: 600; color: var(--muted);
+             text-transform: uppercase; letter-spacing: .06em; margin-bottom: 10px; }
+  .classes { display: flex; flex-direction: column; gap: 4px; }
+  .cls { display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+         border-radius: 6px; border: 1px solid transparent; cursor: pointer;
+         background: var(--surface-2); }
+  .cls:hover { border-color: var(--border); }
+  .cls.on { background: rgba(99,102,241,.18); border-color: var(--accent); }
+  .cls kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+             padding: 1px 6px; font-size: 11px; font-family: ui-monospace, monospace;
+             color: var(--muted); min-width: 20px; text-align: center; }
+  .cls .name { flex: 1; }
+  .cls .score { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .cls.neg.on { background: rgba(34,197,94,.16); border-color: var(--green); }
+  .meta { font-size: 11px; color: var(--muted); word-break: break-all; line-height: 1.5; }
+  .meta a { color: var(--accent); }
+  .pill { display: inline-block; font-size: 10px; text-transform: uppercase;
+          letter-spacing: .05em; padding: 2px 7px; border-radius: 999px;
+          background: var(--surface-2); border: 1px solid var(--border); }
+
+  footer { position: fixed; bottom: 0; left: 0; right: 0; display: flex; gap: 10px;
+           align-items: center; padding: 10px 20px; background: var(--surface);
+           border-top: 1px solid var(--border); }
+  button.act { padding: 8px 16px; border-radius: 8px; border: 1px solid var(--border);
+               background: var(--surface-2); color: var(--text); cursor: pointer;
+               font-size: 13px; font-weight: 500; }
+  button.act.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.act:hover { filter: brightness(1.15); }
+  .hint { font-size: 11px; color: var(--muted); }
+  .hint kbd { background: var(--bg); border: 1px solid var(--border); border-radius: 3px;
+              padding: 1px 5px; font-family: ui-monospace, monospace; }
+  .empty { text-align: center; color: var(--muted); padding: 80px 20px; }
+  #toast { position: fixed; bottom: 62px; right: 20px; background: var(--surface-2);
+           border: 1px solid var(--border); border-radius: 8px; padding: 9px 14px;
+           font-size: 13px; opacity: 0; transition: opacity .15s; pointer-events: none; }
+  #toast.show { opacity: 1; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>XBlock Review</h1>
+  <div class="modes">
+    <button id="m-sweep" class="on" onclick="setMode('sweep')">Sweep</button>
+    <button id="m-detail" onclick="setMode('detail')">Detail</button>
+  </div>
+  <select id="bucket" onchange="load()">
+    <option value="">all buckets</option>
+    <option value="random">random</option>
+    <option value="fired">fired</option>
+    <option value="uncertain">uncertain</option>
+    <option value="multi-candidate">multi-candidate</option>
+    <option value="imported">imported (re-review)</option>
+  </select>
+  <div class="spacer"></div>
+  <div class="counts">
+    <span>reviewed <b id="c-done">–</b></span>
+    <span>pending <b id="c-pending">–</b></span>
+    <span>neg:pos <b id="c-ratio" class="ratio">–</b></span>
+  </div>
+</header>
+
+<main id="main"><div class="empty">Loading…</div></main>
+
+<footer id="footer"></footer>
+<div id="toast"></div>
+
+<script>
+let MODE = 'sweep', CFG = null, ITEMS = [], MARKED = new Set(), CUR = 0, SEL = new Set();
+const KEYS = ['1','2','3','4','5','6','7','8','9','q','w'];   // platforms, by frequency
+const NEG_KEY = '0';
+
+const $ = s => document.querySelector(s);
+function toast(m) { const t = $('#toast'); t.textContent = m; t.classList.add('show');
+  clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove('show'), 1600); }
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) { toast(`error: ${(await r.json().catch(() => ({}))).detail || r.status}`); return null; }
+  return r.json();
+}
+
+function setMode(m) {
+  MODE = m;
+  $('#m-sweep').classList.toggle('on', m === 'sweep');
+  $('#m-detail').classList.toggle('on', m === 'detail');
+  load();
+}
+
+async function refreshStats() {
+  const s = await api('/api/stats'); if (!s) return;
+  $('#c-done').textContent = s.reviewed.toLocaleString();
+  $('#c-pending').textContent = s.pending.toLocaleString();
+  const el = $('#c-ratio');
+  if (s.ratio === null) { el.textContent = '–'; el.className = 'ratio'; }
+  else {
+    el.textContent = s.ratio + '×';
+    // The corpus needs negatives at ~3x positives; anything under is the
+    // false-positive problem still being unsolved.
+    el.className = 'ratio ' + (s.ratio >= 3 ? 'ok' : 'bad');
+  }
+}
+
+async function load() {
+  MARKED.clear(); SEL.clear(); CUR = 0;
+  const bucket = $('#bucket').value;
+  const limit = MODE === 'sweep' ? 60 : 40;
+  const d = await api(`/api/queue?mode=${MODE}&bucket=${bucket}&limit=${limit}`);
+  ITEMS = d ? d.items : [];
+  if (MODE === 'detail') { goTo(0); refreshStats(); } else { render(); refreshStats(); }
+}
+
+function render() { MODE === 'sweep' ? renderSweep() : renderDetail(); }
+
+/* ── sweep ─────────────────────────────────────────────────────────────── */
+function renderSweep() {
+  if (!ITEMS.length) { $('#main').innerHTML =
+    '<div class="empty">Nothing left to sweep in this bucket.</div>';
+    $('#footer').innerHTML = ''; return; }
+
+  $('#main').innerHTML = `<div class="grid">${ITEMS.map((it, i) => `
+    <div class="cell" data-cid="${it.cid}" onclick="toggleCell(this)">
+      <span class="idx">${i + 1}</span>
+      <img src="/api/image/${it.cid}" loading="lazy" alt="">
+    </div>`).join('')}</div>`;
+
+  $('#footer').innerHTML = `
+    <button class="act primary" onclick="submitSweep()">
+      Confirm page &nbsp;<kbd>↵</kbd></button>
+    <button class="act" onclick="doUndo()">Undo <kbd>u</kbd></button>
+    <span class="hint">Click every image that <b>is</b> a screenshot.
+      Everything left unclicked is recorded as <b>negative</b>.
+      <kbd>↵</kbd> confirm · <kbd>u</kbd> undo</span>`;
+}
+
+function toggleCell(el) {
+  const cid = el.dataset.cid;
+  MARKED.has(cid) ? MARKED.delete(cid) : MARKED.add(cid);
+  el.classList.toggle('on', MARKED.has(cid));
+}
+
+async function submitSweep() {
+  if (!ITEMS.length) return;
+  const flagged = [...MARKED];
+  const negative = ITEMS.map(i => i.cid).filter(c => !MARKED.has(c));
+  const r = await api('/api/sweep', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ negative, flagged }) });
+  if (r) { toast(`${r.negative} negative · ${r.flagged} flagged`); load(); }
+}
+
+/* ── detail ────────────────────────────────────────────────────────────── */
+function goTo(idx) {
+  CUR = idx;
+  SEL.clear();
+  // Seed from whatever the image already carries. Reviewing an imported or
+  // partly-labelled image is additive -- confirming a second platform -- not
+  // retyping what is already known.
+  const it = ITEMS[CUR];
+  if (it) (it.labels || []).forEach(l => SEL.add(l));
+  renderDetail();
+}
+
+function renderDetail() {
+  if (CUR >= ITEMS.length) { $('#main').innerHTML =
+    '<div class="empty">Queue finished. Reload for more.</div>';
+    $('#footer').innerHTML = ''; return; }
+
+  const it = ITEMS[CUR];
+  const scores = it.scores || {};
+  const row = (name, key, isNeg) => `
+    <div class="cls ${isNeg ? 'neg' : ''} ${SEL.has(name) ? 'on' : ''}"
+         onclick="toggleClass('${name}')">
+      <kbd>${key}</kbd><span class="name">${name}</span>
+      <span class="score">${scores[name] !== undefined ? scores[name].toFixed(2) : ''}</span>
+    </div>`;
+
+  $('#main').innerHTML = `
+    <div class="detail">
+      <div class="stage"><img src="/api/image/${it.cid}" alt=""></div>
+      <div class="side">
+        <div class="card">
+          <h2>Classes</h2>
+          <div class="classes">
+            ${CFG.platforms.map((n, i) => row(n, KEYS[i] || '·', false)).join('')}
+            ${row(CFG.negative, NEG_KEY, true)}
+          </div>
+        </div>
+        <div class="card">
+          <h2>Context</h2>
+          <div class="meta">
+            <span class="pill">${it.bucket}</span>
+            ${(it.labels || []).length ? ` <span class="pill" style="border-color:var(--accent);color:var(--accent)">${it.labels.length} existing</span>` : ''}
+            ${it.state ? ` <span class="pill">${it.state}</span>` : ''}
+            <div style="margin-top:8px">${CUR + 1} of ${ITEMS.length}</div>
+            <div style="margin-top:6px"><a href="${bskyLink(it.post_uri)}"
+               target="_blank" rel="noreferrer noopener">open post ↗</a></div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  $('#footer').innerHTML = `
+    <button class="act primary" onclick="saveDetail()">Save &amp; next <kbd>↵</kbd></button>
+    <button class="act" onclick="skip()">Skip <kbd>s</kbd></button>
+    <button class="act" onclick="doUndo()">Undo <kbd>u</kbd></button>
+    <span class="hint">Multi-select is the point — a nested screenshot fires more
+      than one. <kbd>0</kbd> negative (exclusive) · <kbd>←</kbd> <kbd>→</kbd> navigate</span>`;
+}
+
+function bskyLink(uri) {
+  const m = /^at:\/\/([^/]+)\/app\.bsky\.feed\.post\/(.+)$/.exec(uri || '');
+  return m ? `https://bsky.app/profile/${m[1]}/post/${m[2]}` : '#';
+}
+
+function toggleClass(name) {
+  if (name === CFG.negative) {
+    // Negative is exclusive: an image is either not a screenshot, or it is one
+    // of something. The server enforces this too.
+    SEL.has(name) ? SEL.delete(name) : (SEL.clear(), SEL.add(name));
+  } else {
+    SEL.delete(CFG.negative);
+    SEL.has(name) ? SEL.delete(name) : SEL.add(name);
+  }
+  renderDetail();
+}
+
+async function saveDetail() {
+  const it = ITEMS[CUR]; if (!it) return;
+  if (!SEL.size) { toast('pick at least one class, or Skip'); return; }
+  const r = await api('/api/label', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cid: it.cid, labels: [...SEL] }) });
+  if (r) { goTo(CUR + 1); refreshStats(); }
+}
+
+async function skip() {
+  const it = ITEMS[CUR]; if (!it) return;
+  await api('/api/label', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cid: it.cid, labels: [], skip: true }) });
+  goTo(CUR + 1); refreshStats();
+}
+
+async function doUndo() {
+  const r = await api('/api/undo');
+  if (r && r.ok) { toast('undone'); if (MODE === 'detail' && CUR > 0) CUR--; load(); }
+}
+
+/* ── keyboard ──────────────────────────────────────────────────────────── */
+document.addEventListener('keydown', e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+
+  if (k === 'enter') { e.preventDefault(); MODE === 'sweep' ? submitSweep() : saveDetail(); return; }
+  if (k === 'u') { e.preventDefault(); doUndo(); return; }
+  if (MODE !== 'detail') return;
+
+  if (k === 's') { e.preventDefault(); skip(); return; }
+  if (k === 'arrowright') { e.preventDefault(); if (CUR < ITEMS.length - 1) goTo(CUR + 1); return; }
+  if (k === 'arrowleft')  { e.preventDefault(); if (CUR > 0) goTo(CUR - 1); return; }
+  if (k === NEG_KEY) { e.preventDefault(); toggleClass(CFG.negative); return; }
+  const i = KEYS.indexOf(k);
+  if (i >= 0 && i < CFG.platforms.length) { e.preventDefault(); toggleClass(CFG.platforms[i]); }
+});
+
+(async () => { CFG = await api('/api/config'); await load(); })();
+</script>
+</body>
+</html>

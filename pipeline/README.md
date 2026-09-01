@@ -28,6 +28,7 @@ negatives that teach nothing. So:
 | `random` | unbiased sample of the production stream | the true prior — what a frozen eval set needs and a curated corpus cannot give you |
 | `fired` | model scores ≥ threshold on some class | candidate false positives: the negatives actually worth labelling |
 | `uncertain` | top non-negative score in 0.35–0.75 | where the decision boundary is, so where new labels move it most |
+| `multi-candidate` | two classes both scoring ≥ 0.35 | nested screenshots — the case the single-label corpus could never express, and which random sampling essentially never turns up |
 
 `random` needs no model. `fired` and `uncertain` need `--score`.
 
@@ -55,6 +56,159 @@ python harvest.py export --split unassigned --out review.jsonl
 `--db` defaults to `$PIPELINE_DB` if set, so this can share the database
 `processor/worker.py` already writes model scores into.
 
+## Review
+
+```bash
+python review.py --db data/pipeline.db --images data/images
+# http://127.0.0.1:8081
+```
+
+Two modes, because the work has two shapes:
+
+**Sweep** — a grid of thumbnails. Click the few that *are* screenshots; everything
+left unclicked is recorded as `negative` on submit. This is how ~3,000 negatives
+get labelled in well under an hour. Thumbnails are top-anchored rather than
+centre-cropped: platform chrome lives along the top edge, and centre-cropping a
+tall screenshot to a square throws away the part you are judging.
+
+**Detail** — one image at a time, multi-select by keyboard. For whatever the
+sweep flagged, and for the `fired` and `uncertain` buckets where the judgement
+matters. Model scores are shown inline per class.
+
+| key | |
+|---|---|
+| `1`–`9`, `q`, `w` | platform classes, ordered by corpus frequency |
+| `0` | negative — exclusive, clears the rest |
+| `↵` | confirm page (sweep) / save and advance (detail) |
+| `s` `u` `←` `→` | skip, undo, navigate |
+
+Multi-select is the point: a nested screenshot fires more than one class, and
+that is the case the old ImageFolder corpus could not express.
+
+Nothing is auto-labelled. `negative` is only ever inferred from an explicit
+human submit of a sweep page.
+
+## Importing the existing corpus
+
+```bash
+python import_corpus.py --dry-run
+python import_corpus.py --apply
+```
+
+Pulls the ImageFolder dataset in, applying the same class surgery as the training
+notebook (drop `news`, rename `altright` → `truthsocial`).
+
+**A CID in two folders means both labels**, so every file is read rather than
+deduplicated on first sight. 37 of 1,581 distinct images are filed twice — but
+only 6 are genuine co-occurrence (0.38%). The other 31 pair a platform with
+`negative`, which is a contradiction rather than a co-occurrence (29 are
+`discord + negative`, which looks like one bulk misfile). Those are resolved from `conflict_resolutions.json` where a human has recorded a
+decision, and otherwise import with **no label** and go to the review queue —
+never guessed.
+
+The 29 `discord + negative` images were reviewed by hand: 27 are Discord, 2 are
+genuinely negative. That means the `negative` class was ~15% Discord screenshots,
+which matters more than the count suggests, since negatives are what govern the
+false-positive rate. The decisions live in the repo so they survive rebuilding
+the manifest from scratch.
+
+**Imported labels are "at least this", not "exactly this."** Double-filing is a
+lower bound on co-occurrence, not a measurement: a nested screenshot filed once
+under its dominant platform is indistinguishable from a single-platform one. That
+is why imported rows keep `review_state='imported'` and stay re-reviewable rather
+than being marked done — including the 29 conflict resolutions, which settled
+which folder was right and said nothing about whether a second platform appears. That matters under `BCEWithLogitsLoss`, where an unrecorded positive
+becomes an explicit zero in the target — training the model to suppress the very
+co-occurrence you want it to learn.
+
+So imported rows get `source='imagefolder-v1'` and `review_state='imported'`,
+never `human`/`done`. They stay out of the default review queue but the
+`imported (re-review)` bucket filter surfaces them, and a human label supersedes
+the imported one.
+
+## Importing moderation signal from Ozone
+
+```bash
+export OZONE_DB_URL=postgres://user:pass@host/ozone
+python import_ozone.py --bot-did did:plc:... --dry-run
+python import_ozone.py --bot-did did:plc:... --apply
+```
+
+Ozone holds the moderation record, not images — but `moderation_event` carries
+`subjectBlobCids`, so images are recoverable from the CDN by CID.
+
+| bucket | what it is |
+|---|---|
+| `ozone-false-positive` | a human negated a label the model applied — a confirmed FP with a moderator's judgement attached |
+| `ozone-appeal` | a report with an appeal `reasonType` — the strongest FP evidence there is |
+| `ozone-reported` | user-submitted report |
+| `ozone-human` | a moderator applied this label by hand |
+| `ozone-model` | the labeller fired; unverified |
+
+**Nothing from Ozone is written as `source='human'`** unless a human moderator
+actually did it. Model labels are the model's own predictions: training on them
+entrenches the current decision boundary instead of correcting it, and drift *is*
+a decision-boundary problem. They arrive as candidates for review.
+
+Ozone also has **almost no negatives** — everything in it either fired or was
+complained about. It is not a sample of the firehose, so `harvest.py` stays
+necessary for the corpus's largest gap.
+
+`--bot-did` is required: `createdBy` is what separates the model's own labels
+from a moderator's, and it works across the whole history. `modTool.meta.isAutomated`
+is Ozone's own field for this and `moderate.py` now sets it, but older events
+predate it.
+
+## Splits
+
+```bash
+python assign_splits.py            # dry run, with a per-class report
+python assign_splits.py --apply
+```
+
+Assigned **once**, in the manifest, and **never reassigned** — that is what keeps
+a frozen evaluation set frozen as the corpus grows. The previous notebook split
+inside `train()` and pointed its test set at the whole corpus, which is why its
+`TEST AUROC 0.983` read above `valid 0.959`.
+
+Stratification is the usual greedy approximation of iterative stratification
+(labels are sets, so ordinary stratification doesn't apply), plus a floor pass:
+at 80/10/10 a six-image class rounds to 0.6 expected in each of val and test, and
+greedy assignment leaves one of them empty — which makes the class *invisible* to
+evaluation rather than merely noisy. One image per split is reserved for every
+class that can spare it. Read the per-class report; with classes this small it
+matters more than the method.
+
+## Training from the manifest
+
+```python
+from dataset import load_manifest_dataset
+ds = load_manifest_dataset(DB, IMAGES, split="train")
+```
+
+`labels` arrives already multi-hot, replacing the notebook's
+
+```python
+labels = torch.tensor([[x] for x in batch['label']])
+batch['labels'] = nn.functional.one_hot(labels, num_classes).sum(dim=1)
+```
+
+which assumes exactly one integer label per image and so cannot express a
+co-occurrence however the model is trained.
+
+### Multi-label coverage
+
+```bash
+python dataset.py --co-occurrence
+```
+
+Multi-label is a design property of the system — the head is sigmoid and a
+screenshot of a screenshot genuinely carries two labels. The data doesn't have to
+justify that. But a class the model never sees co-occurring **cannot learn to
+co-occur**, so this reports coverage: which pairs have been observed, and which
+classes have no co-occurrence example at all. Those can only ever be predicted
+alone, and the `multi-candidate` harvest bucket targets exactly that gap.
+
 ## Schema
 
 - `images` — one row per distinct image. `cid` is a content hash, so byte-identical
@@ -64,6 +218,9 @@ python harvest.py export --split unassigned --out review.jsonl
 - `splits` — kept apart from `labels` so relabelling an image can never silently
   move it between train and eval. A frozen eval set only stays frozen if its
   membership lives somewhere relabelling does not touch.
+- `review_state` — review progress, kept apart from `labels` so "confirmed
+  negative" and "not looked at yet" stay distinguishable. Without it an image
+  with no labels is ambiguous and a 3,000-image sweep cannot be resumed.
 - `model_scores` — shape-compatible with what `worker.py` already writes.
 
 ## Notes

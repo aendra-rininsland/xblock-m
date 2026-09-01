@@ -28,6 +28,9 @@ negatives that teach nothing. Buckets:
              false positives: the negatives actually worth labelling.
   uncertain  Max non-negative score in the uncertainty band. Where the decision
              boundary is, so where new labels move it most.
+  multi-cand Two or more classes scoring meaningfully. Nested screenshots -- the
+             case the single-label corpus could never express -- which random
+             sampling will essentially never turn up.
 
 Bucketing needs --score (loads the model). Without it everything is `random`,
 which is still the single most useful thing to collect right now.
@@ -60,6 +63,8 @@ from pathlib import Path
 
 import aiohttp
 
+from manifest import connect, image_path
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("harvest")
 
@@ -71,81 +76,11 @@ CDN = "https://cdn.bsky.app/img/feed_thumbnail/plain/{did}/{cid}@jpeg"
 
 DEFAULT_DB = os.getenv("PIPELINE_DB") or str(Path(__file__).parent / "data" / "pipeline.db")
 UNCERTAIN_BAND = (0.35, 0.75)
+# Second-highest non-negative score at or above this makes an image a candidate
+# for carrying more than one label.
+MULTI_CANDIDATE_FLOOR = 0.35
 FETCH_CONCURRENCY = 16
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
-
-
-# ── schema ────────────────────────────────────────────────────────────────────
-
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-
--- One row per distinct image. cid is a content hash, so this deduplicates
--- byte-identical re-uploads for free and makes harvests resumable.
-CREATE TABLE IF NOT EXISTS images (
-    cid          TEXT PRIMARY KEY,
-    did          TEXT NOT NULL,
-    rkey         TEXT NOT NULL,
-    post_uri     TEXT NOT NULL,
-    path         TEXT NOT NULL,
-    bytes        INTEGER,
-    harvested_at TEXT NOT NULL,
-    bucket       TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_images_bucket ON images(bucket);
-
--- The point of the exercise: an image carries a SET of labels, not one.
--- `source` records provenance, so a human decision can outrank a model guess
--- and an Ozone appeal can be told apart from a hand review.
-CREATE TABLE IF NOT EXISTS labels (
-    cid        TEXT NOT NULL,
-    label      TEXT NOT NULL,
-    source     TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (cid, label, source)
-);
-CREATE INDEX IF NOT EXISTS idx_labels_cid ON labels(cid);
-
--- Kept separate from labels so that relabelling an image never silently moves
--- it between train and eval. A frozen eval set only stays frozen if its
--- membership lives somewhere relabelling does not touch.
-CREATE TABLE IF NOT EXISTS splits (
-    cid         TEXT PRIMARY KEY,
-    split       TEXT NOT NULL,
-    assigned_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_splits_split ON splits(split);
-
--- Shape matches what processor/worker.py already writes, so the two can share a
--- database. Note image_cid is the sole primary key: one score row per image, not
--- one per (image, model). Storing scores from several models -- which shadow
--- comparison would want -- needs a migration first.
-CREATE TABLE IF NOT EXISTS model_scores (
-    image_cid  TEXT PRIMARY KEY,
-    top_label  TEXT,
-    top_score  REAL,
-    all_scores TEXT,
-    scored_at  TEXT,
-    model      TEXT
-);
-"""
-
-
-def connect(db_path: str) -> sqlite3.Connection:
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.executescript(SCHEMA)
-    # Older databases predate `model`; CREATE TABLE IF NOT EXISTS will not add it.
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(model_scores)")}
-    if "model" not in cols:
-        conn.execute("ALTER TABLE model_scores ADD COLUMN model TEXT")
-    conn.commit()
-    return conn
-
-
-def image_path(root: Path, cid: str) -> Path:
-    """Shard by the first two characters so no directory holds 10k+ files."""
-    return root / cid[:2] / f"{cid}.jpeg"
 
 
 # ── optional scoring ──────────────────────────────────────────────────────────
@@ -228,9 +163,25 @@ def eligible_images(evt: dict) -> tuple[str, str, list[str]] | None:
 
 
 def classify_bucket(scores: dict[str, float], threshold: float) -> str:
-    """Which stratum this image belongs to, given the current model's opinion."""
-    non_neg = [v for k, v in scores.items() if k != "negative"]
-    top = max(non_neg) if non_neg else 0.0
+    """Which stratum this image belongs to, given the current model's opinion.
+
+    multi-candidate is checked before fired: an image scoring twitter 0.95 and
+    bluesky 0.4 is both a false-positive candidate and a co-occurrence candidate,
+    and the second reading is the scarcer one. Nested screenshots are the case
+    the single-label corpus could never teach, and random sampling will almost
+    never surface them.
+
+    Worth knowing this is partly circular -- a model trained only on single-label
+    data is biased toward one confident class, so it under-reports exactly what
+    is being mined. A genuinely nested image still presents visual evidence for
+    both platforms, so it should surface them far better than chance, but the
+    yield is worth measuring rather than assuming.
+    """
+    non_neg = sorted((v for k, v in scores.items() if k != "negative"), reverse=True)
+    top = non_neg[0] if non_neg else 0.0
+    second = non_neg[1] if len(non_neg) > 1 else 0.0
+    if second >= MULTI_CANDIDATE_FLOOR:
+        return "multi-candidate"
     if top >= threshold:
         return "fired"
     if UNCERTAIN_BAND[0] <= top <= UNCERTAIN_BAND[1]:
@@ -458,7 +409,7 @@ def main() -> None:
     h.add_argument("--score", action="store_true", help="score while harvesting (needs torch)")
     h.add_argument("--model", default=os.getenv("MODEL_NAME", "swin_s3_base_224-xblockm-timm"))
     h.add_argument("--threshold", type=float, default=float(os.getenv("INFERENCE_THRESHOLD", "0.8")))
-    h.add_argument("--bucket", choices=["random", "fired", "uncertain"],
+    h.add_argument("--bucket", choices=["random", "fired", "uncertain", "multi-candidate"],
                    help="keep only this bucket (implies --score)")
     h.set_defaults(fn=harvest)
 
@@ -466,7 +417,7 @@ def main() -> None:
     s.set_defaults(fn=stats)
 
     e = sub.add_parser("export", help="emit a JSONL review queue")
-    e.add_argument("--bucket", choices=["random", "fired", "uncertain"])
+    e.add_argument("--bucket", choices=["random", "fired", "uncertain", "multi-candidate"])
     e.add_argument("--split", help="a split name, or 'unassigned'")
     e.add_argument("--limit", type=int, default=1000)
     e.add_argument("--out", default="-")

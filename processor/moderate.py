@@ -8,6 +8,7 @@ from atproto_client.exceptions import BadRequestError, UnauthorizedError
 from dotenv import load_dotenv
 
 from constants import THRESHOLD
+from label_values import LABEL_VALUES
 
 load_dotenv()
 
@@ -22,39 +23,19 @@ _AUTH_ERROR_CODES = {"ExpiredToken", "AuthenticationRequired", "InvalidToken"}
 
 MODEL_NAME = os.getenv("MODEL_NAME", "swin_s3_base_224-xblockm-timm")
 
-# Model class name -> the label value published to subscribers.
-#
-# Kept explicit rather than interpolated as f"{label}-screenshot" so the two can
-# be versioned independently. Renaming a class in the training set must not
-# silently change what subscribers receive: anyone filtering on the old value
-# would simply stop matching, with nothing in the logs to say why.
-#
-# None means "the model may predict this, but nothing is published".
-LABEL_VALUES: dict[str, str | None] = {
-    # `altright` was renamed to `truthsocial` in the training set -- it is a
-    # platform class (Truth Social's UI), not an ideological judgement. The
-    # published value stays the legacy one until subscribers have migrated;
-    # flip it to "truthsocial-screenshot" once they have.
-    "truthsocial": "altright-screenshot",
-    "bluesky":     "bluesky-screenshot",
-    "discord":     "discord-screenshot",
-    "facebook":    "facebook-screenshot",
-    "fediverse":   "fediverse-screenshot",
-    "instagram":   "instagram-screenshot",
-    "ngl":         "ngl-screenshot",
-    "reddit":      "reddit-screenshot",
-    "threads":     "threads-screenshot",
-    "tumblr":      "tumblr-screenshot",
-    "twitter":     "twitter-screenshot",
-
-    # "not a screenshot" is the absence of a label, never a label of its own.
-    "negative":    None,
-
-    # Retired classes. Retained so that rolling back to an older checkpoint
-    # cannot start publishing something unexpected.
-    "altright":    "altright-screenshot",
-    "news":        None,
-    "newsmedia":   None,
+# Ozone's own field for "where did this action come from". report.isAutomated is
+# denormalised from modTool.meta.isAutomated, so without this Ozone cannot tell
+# the labeller's events apart from a human moderator's, its UI cannot filter
+# them, and anything reading isAutomated downstream is simply wrong. The model
+# name is also in `comment` for readability in the mod log, but that is an
+# unstructured string; this is the field designed for it.
+MOD_TOOL = {
+    "name": "xblock",
+    "meta": {
+        "isAutomated": True,
+        "model": f"howdyaendra/{MODEL_NAME}",
+        "threshold": THRESHOLD,
+    },
 }
 
 
@@ -191,6 +172,8 @@ async def _emit_label(result: dict) -> None:
         "createdBy": client._session.did,
         "createdAt": datetime.datetime.now().isoformat(),
         "subjectBlobCids": blob_cids,
+        # Top-level, sibling to `event` -- see tools.ozone.moderation.emitEvent.
+        "modTool": MOD_TOOL,
     }
 
     logger.debug("Emitting labels %s for %s", add_labels, uri)
