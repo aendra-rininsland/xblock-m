@@ -46,6 +46,18 @@ Mine current false positives (needs the processor/ deps):
 python harvest.py harvest --target 500 --bucket fired
 ```
 
+Check for truncated downloads, and purge them so a fresh harvest refetches:
+
+```bash
+python harvest.py verify
+python harvest.py verify --repair
+```
+
+A partial JPEG still *decodes* — it renders the scanlines that arrived and fills
+the rest — so a truncated download lands in the corpus looking like a real image.
+`verify` catches them structurally (a JPEG must end with its EOI marker). It
+refuses to delete anything carrying a human label.
+
 Inspect, and emit a review queue:
 
 ```bash
