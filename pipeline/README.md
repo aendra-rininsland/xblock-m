@@ -91,7 +91,7 @@ human submit of a sweep page.
 ## Importing the existing corpus
 
 ```bash
-python import_corpus.py --dry-run
+python import_corpus.py            # dry run (the default)
 python import_corpus.py --apply
 ```
 
@@ -130,7 +130,7 @@ the imported one.
 
 ```bash
 export OZONE_DB_URL=postgres://user:pass@host/ozone
-python import_ozone.py --bot-did did:plc:... --dry-run
+python import_ozone.py --bot-did did:plc:...     # dry run
 python import_ozone.py --bot-did did:plc:... --apply
 ```
 
@@ -162,7 +162,7 @@ predate it.
 ## Splits
 
 ```bash
-python assign_splits.py            # dry run, with a per-class report
+python assign_splits.py            # dry run (the default), with a per-class report
 python assign_splits.py --apply
 ```
 
