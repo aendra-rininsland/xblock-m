@@ -20,8 +20,7 @@ from io import BytesIO
 from PIL import Image
 from safetensors.torch import load_file
 from timm import create_model
-
-from constants import THRESHOLD
+from constants import MAX_JOB_AGE_MS, THRESHOLD
 from preprocessing import IMG_SIZE, build_transform
 from moderate import auth_client, create_label
 
@@ -332,7 +331,42 @@ async def process_single_image(image_url: str, cid: str, top_k: int = 10) -> dic
 
 # ── Job processing ────────────────────────────────────────────────────────────
 
+# Stale-skip bookkeeping. A run through a large backlog can skip for a long
+# time; the watchdog restarts the worker if no job has been recorded for five
+# minutes, so a periodic heartbeat row keeps it from killing a healthy process.
+_stale_skipped = 0
+_stale_reported_at = 0.0
+
+
+def _job_age_ms(job) -> float | None:
+    """Age of a job in ms, or None if it cannot be determined.
+
+    Uses the BullMQ enqueue timestamp, never record.createdAt -- that field is
+    user-controlled and a post could carry any value it likes, including a future
+    one to dodge expiry.
+    """
+    ts = getattr(job, "timestamp", None)
+    if not ts:
+        return None
+    return time.time() * 1000 - float(ts)
+
+
 async def process_request(job, token):
+    global _stale_skipped, _stale_reported_at
+
+    age_ms = _job_age_ms(job)
+    if age_ms is not None and age_ms > MAX_JOB_AGE_MS:
+        _stale_skipped += 1
+        now_s = time.time()
+        if now_s - _stale_reported_at >= 60:
+            logger.info("skipped %d stale jobs (oldest seen %.1fh) in the last %.0fs",
+                        _stale_skipped, age_ms / 3_600_000, now_s - _stale_reported_at)
+            # Heartbeat so watchdog.py sees the worker making progress.
+            log_metric(0, 0, 0.0, 0)
+            _stale_skipped = 0
+            _stale_reported_at = now_s
+        return None
+
     start_time = time.time()
     input_data = job.data
     if isinstance(input_data, dict):

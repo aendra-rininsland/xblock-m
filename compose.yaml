@@ -6,13 +6,33 @@ services:
     restart: unless-stopped
     ports:
       - 6379:6379
+    # maxmemory was unset (0 = unlimited), so a stalled worker would grow the
+    # queue until the box OOM-killed Redis and the whole queue was lost. With a
+    # limit, `queue.add` in the firehose fails loudly instead and Redis stays up
+    # while the worker drains.
+    #
+    # The policy MUST be noeviction. An LRU policy would evict individual job
+    # hashes while leaving their ids in the wait list -- dangling entries
+    # pointing at nothing, which silently corrupts the queue.
+    #
+    # Persistence is off deliberately. It was already not working: the official
+    # image writes to /data, while the volume below was mounted at /var/redis, so
+    # nothing survived a recreate. Turning it on properly would be worse here --
+    # BGSAVE forks, and copy-on-write can transiently double memory on a
+    # multi-gigabyte queue, which is exactly what the instance is sized against.
+    # The queue is deliberately discardable (stale jobs are aged out anyway) and
+    # refills from the firehose.
+    command: >
+      redis-server
+      --maxmemory ${REDIS_MAXMEMORY:-2gb}
+      --maxmemory-policy noeviction
+      --save ""
+      --appendonly no
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 5s
       retries: 10
-    volumes:
-      - redis:/var/redis
 
   firehose:
     container_name: firehose
@@ -29,5 +49,3 @@ services:
       - firehose
     command: npm run worker
 
-volumes:
-  redis:
