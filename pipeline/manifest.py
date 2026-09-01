@@ -9,6 +9,7 @@ unlearnable no matter how the model is trained. This schema is the fix.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -96,6 +97,22 @@ SKIPPED = "skipped"            # deliberately passed over (unclear, NSFW, broken
 # Distinct from DONE so a re-review pass can find rows nobody has confirmed under
 # the multi-label regime.
 IMPORTED = "imported"
+
+
+def default_db() -> str:
+    """Where the manifest lives, honouring $PIPELINE_DB.
+
+    Every tool must resolve this the same way. harvest.py used to honour the
+    environment variable while the others fell back to a repo-relative path, so
+    exporting PIPELINE_DB silently split the manifest in two: the harvester wrote
+    to one database and the importers to another.
+    """
+    return os.getenv("PIPELINE_DB") or str(Path(__file__).parent / "data" / "pipeline.db")
+
+
+def default_images() -> str:
+    """Where image files live, honouring $PIPELINE_IMAGES."""
+    return os.getenv("PIPELINE_IMAGES") or str(Path(__file__).parent / "data" / "images")
 
 
 def connect(db_path: str) -> sqlite3.Connection:

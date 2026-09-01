@@ -54,7 +54,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "processor"))
 
 from label_values import model_class  # noqa: E402
-from manifest import IMPORTED, NEEDS_DETAIL, connect, image_path  # noqa: E402
+from manifest import (IMPORTED, NEEDS_DETAIL, connect, default_db,
+                      default_images, image_path)
 
 CDN = "https://cdn.bsky.app/img/feed_thumbnail/plain/{did}/{cid}@jpeg"
 
@@ -184,8 +185,8 @@ def main() -> None:
     here = Path(__file__).parent
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--db", default=str(here / "data" / "pipeline.db"))
-    p.add_argument("--images", default=str(here / "data" / "images"))
+    p.add_argument("--db", default=default_db())
+    p.add_argument("--images", default=default_images())
     p.add_argument("--dsn", default=os.getenv("OZONE_DB_URL"))
     p.add_argument("--bot-did", default=os.getenv("OZONE_BOT_DID"),
                    help="the labeller's DID -- the discriminator for model vs human")

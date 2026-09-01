@@ -3,6 +3,20 @@
 Data collection for retraining. Samples the live firehose into a SQLite manifest
 where an image carries a **set** of labels.
 
+## Where the manifest lives
+
+Every tool resolves the same two paths, honouring the environment:
+
+```bash
+export PIPELINE_DB=/path/to/pipeline.db        # default: pipeline/data/pipeline.db
+export PIPELINE_IMAGES=/path/to/images         # default: pipeline/data/images
+```
+
+Set them **before any tool runs**, or not at all. They must be consistent across
+`harvest`, `import_corpus`, `assign_splits`, `review`, `import_ozone` and
+`dataset` — those all read and write one shared manifest, and pointing some of
+them at a different file splits it in two.
+
 ## Why
 
 Two problems with the current corpus that no amount of training fixes:

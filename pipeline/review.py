@@ -35,7 +35,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from manifest import (CLASSES, DONE, IMPORTED, NEEDS_DETAIL, NEGATIVE, PENDING,
-                      PLATFORM_CLASSES, SKIPPED, connect, image_path)
+                      PLATFORM_CLASSES, SKIPPED, connect, image_path, default_db,
+                      default_images)
 
 app = FastAPI(title="xblock review")
 
@@ -244,8 +245,8 @@ def main() -> None:
     here = Path(__file__).parent
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--db", default=str(here / "data" / "pipeline.db"))
-    p.add_argument("--images", default=str(here / "data" / "images"))
+    p.add_argument("--db", default=default_db())
+    p.add_argument("--images", default=default_images())
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8081)
     args = p.parse_args()

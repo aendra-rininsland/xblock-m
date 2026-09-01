@@ -63,7 +63,7 @@ from pathlib import Path
 
 import aiohttp
 
-from manifest import connect, image_path
+from manifest import connect, image_path, default_db, default_images
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("harvest")
@@ -74,7 +74,6 @@ JETSTREAM = os.getenv(
 )
 CDN = "https://cdn.bsky.app/img/feed_thumbnail/plain/{did}/{cid}@jpeg"
 
-DEFAULT_DB = os.getenv("PIPELINE_DB") or str(Path(__file__).parent / "data" / "pipeline.db")
 UNCERTAIN_BAND = (0.35, 0.75)
 # Second-highest non-negative score at or above this makes an image a candidate
 # for carrying more than one label.
@@ -490,13 +489,13 @@ def export(args: argparse.Namespace) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--db", default=DEFAULT_DB, help=f"manifest database (default: {DEFAULT_DB})")
+    p.add_argument("--db", default=default_db(), help="manifest database ($PIPELINE_DB)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     h = sub.add_parser("harvest", help="sample the firehose into the manifest")
     h.add_argument("--target", type=int, default=1000, help="stop after N new images")
     h.add_argument("--rate", type=float, default=0.05, help="fraction of eligible posts to sample")
-    h.add_argument("--images", default=str(Path(__file__).parent / "data" / "images"))
+    h.add_argument("--images", default=default_images())
     h.add_argument("--score", action="store_true", help="score while harvesting (needs torch)")
     h.add_argument("--model", default=os.getenv("MODEL_NAME", "swin_s3_base_224-xblockm-timm"))
     h.add_argument("--threshold", type=float, default=float(os.getenv("INFERENCE_THRESHOLD", "0.8")))
@@ -508,7 +507,7 @@ def main() -> None:
     s.set_defaults(fn=stats)
 
     v = sub.add_parser("verify", help="find truncated images already in the manifest")
-    v.add_argument("--images", default=str(Path(__file__).parent / "data" / "images"))
+    v.add_argument("--images", default=default_images())
     v.add_argument("--repair", action="store_true",
                    help="delete the bad rows so a fresh harvest refetches them")
     v.set_defaults(fn=verify)

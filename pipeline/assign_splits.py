@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dataset import read_rows
-from manifest import CLASSES, connect
+from manifest import CLASSES, connect, default_db, default_images
 
 
 def plan_splits(rows: list[dict], targets: dict[str, float], seed: int) -> dict[str, str]:
@@ -111,8 +111,8 @@ def main() -> None:
     here = Path(__file__).parent
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--db", default=str(here / "data" / "pipeline.db"))
-    p.add_argument("--images", default=str(here / "data" / "images"))
+    p.add_argument("--db", default=default_db())
+    p.add_argument("--images", default=default_images())
     p.add_argument("--train", type=float, default=0.8)
     p.add_argument("--val", type=float, default=0.1)
     p.add_argument("--test", type=float, default=0.1)
