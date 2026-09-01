@@ -115,11 +115,16 @@ def main() -> None:
     p.add_argument("--queue", default="xblock")
     p.add_argument("--prefix", default="bull")
     p.add_argument("--max-age-hours", type=float, default=MAX_JOB_AGE_HOURS)
+    p.add_argument("--dry-run", action="store_true",
+                   help="report without writing (this is the default)")
     p.add_argument("--apply", action="store_true", help="actually delete (default is a dry run)")
     p.add_argument("--limit", type=int, default=0, help="stop after N deletions (0 = no limit)")
     p.add_argument("--interval", type=int, default=0,
                    help="run forever, trimming every N seconds (for supervisord)")
     args = p.parse_args()
+
+    if args.dry_run and args.apply:
+        sys.exit("--dry-run and --apply are contradictory; a dry run is the default")
 
     # Line-buffer stdout. Without this the per-pass output sits in a 4KB buffer
     # and supervisord's trim.log stays empty for hours, which makes a daemon that

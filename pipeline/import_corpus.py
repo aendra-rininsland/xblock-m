@@ -40,7 +40,7 @@ Re-review them in the UI with the `imported` bucket filter. `dataset.py
 --co-occurrence` reports how often a second label gets added, which is the
 cheapest way to find out whether nested screenshots are common enough to matter.
 
-    python import_corpus.py --dry-run
+    python import_corpus.py              # dry run (the default)
     python import_corpus.py --apply
 """
 from __future__ import annotations
@@ -141,8 +141,13 @@ def main() -> None:
     p.add_argument("--db", default=str(here / "data" / "pipeline.db"))
     p.add_argument("--images", default=str(here / "data" / "images"))
     p.add_argument("--dataset", default=HF_DATASET)
+    p.add_argument("--dry-run", action="store_true",
+                   help="report without writing (this is the default)")
     p.add_argument("--apply", action="store_true", help="write (default is a dry run)")
     args = p.parse_args()
+
+    if args.dry_run and args.apply:
+        sys.exit("--dry-run and --apply are contradictory; a dry run is the default")
 
     try:
         import datasets

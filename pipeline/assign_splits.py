@@ -31,6 +31,7 @@ the per-class report at the end matters more than the method -- read it.
 from __future__ import annotations
 
 import argparse
+import sys
 import random
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -116,8 +117,13 @@ def main() -> None:
     p.add_argument("--val", type=float, default=0.1)
     p.add_argument("--test", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--dry-run", action="store_true",
+                   help="report without writing (this is the default)")
     p.add_argument("--apply", action="store_true", help="write (default is a dry run)")
     args = p.parse_args()
+
+    if args.dry_run and args.apply:
+        sys.exit("--dry-run and --apply are contradictory; a dry run is the default")
 
     targets = {"train": args.train, "val": args.val, "test": args.test}
     total = sum(targets.values())

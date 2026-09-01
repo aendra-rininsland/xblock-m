@@ -38,7 +38,7 @@ Older events predate modTool, so `createdBy` is the discriminator that works
 across the whole history.
 
     export OZONE_DB_URL=postgres://user:pass@host/ozone
-    python import_ozone.py --bot-did did:plc:... --dry-run
+    python import_ozone.py --bot-did did:plc:...            # dry run
     python import_ozone.py --bot-did did:plc:... --apply --since 2025-01-01
 """
 from __future__ import annotations
@@ -194,8 +194,13 @@ def main() -> None:
     p.add_argument("--limit", type=int, default=20000, help="per signal kind")
     p.add_argument("--kinds", default=",".join(QUERIES),
                    help="comma-separated subset of: " + ", ".join(QUERIES))
+    p.add_argument("--dry-run", action="store_true",
+                   help="report without writing (this is the default)")
     p.add_argument("--apply", action="store_true", help="write (default is a dry run)")
     args = p.parse_args()
+
+    if args.dry_run and args.apply:
+        sys.exit("--dry-run and --apply are contradictory; a dry run is the default")
 
     if not args.dsn:
         sys.exit("set OZONE_DB_URL or pass --dsn")
