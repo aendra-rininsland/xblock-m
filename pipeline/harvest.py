@@ -191,6 +191,22 @@ def classify_bucket(scores: dict[str, float], threshold: float) -> str:
 
 # ── harvest ───────────────────────────────────────────────────────────────────
 
+def looks_complete(data: bytes) -> bool:
+    """Structural check that the bytes are a whole image, not a prefix of one.
+
+    Truncation is the failure that matters here: a partial JPEG still decodes,
+    it just renders the scanlines that arrived and fills the rest, so it lands in
+    the corpus looking like a real image with most of it replaced by garbage.
+    """
+    if len(data) < 100:
+        return False
+    if data[:2] == b"\xff\xd8":                      # JPEG: needs its EOI marker
+        return data.rstrip(b"\x00")[-2:] == b"\xff\xd9"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":              # PNG: needs IEND
+        return b"IEND" in data[-16:]
+    return True                                       # unknown type: don't guess
+
+
 async def fetch(session: aiohttp.ClientSession, url: str) -> bytes | None:
     try:
         async with session.get(url) as resp:
@@ -199,7 +215,29 @@ async def fetch(session: aiohttp.ClientSession, url: str) -> bytes | None:
             if resp.content_length and resp.content_length > MAX_IMAGE_BYTES:
                 log.warning("skipping oversized image (%s bytes)", resp.content_length)
                 return None
-            return await resp.content.read(MAX_IMAGE_BYTES + 1)
+
+            # NOT resp.content.read(n): StreamReader.read() returns UP TO n bytes
+            # and returns as soon as anything is buffered, so it hands back the
+            # first chunk and silently truncates the image. Read to EOF, capping
+            # as we go.
+            buf = bytearray()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                buf.extend(chunk)
+                if len(buf) > MAX_IMAGE_BYTES:
+                    log.warning("oversized image, discarding: %s", url)
+                    return None
+            data = bytes(buf)
+
+            # Content-Length is the definitive truncation check when the server
+            # sends one; the structural check covers chunked responses that don't.
+            if resp.content_length is not None and len(data) != resp.content_length:
+                log.warning("short read %d/%d bytes: %s", len(data),
+                            resp.content_length, url)
+                return None
+            if not looks_complete(data):
+                log.warning("incomplete image discarded: %s", url)
+                return None
+            return data
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         log.debug("fetch failed %s: %s", url, e)
         return None
@@ -355,6 +393,59 @@ def stats(args: argparse.Namespace) -> None:
     conn.close()
 
 
+def verify(args: argparse.Namespace) -> None:
+    """Find images already in the manifest whose file is truncated.
+
+    Needed because a bad harvest cannot simply be re-run: cids already in the
+    images table are treated as seen and skipped, so the corrupt files would
+    persist silently into training.
+    """
+    conn = connect(args.db)
+    conn.row_factory = sqlite3.Row
+    root = Path(args.images)
+
+    bad, missing, protected, ok = [], [], [], 0
+    for r in conn.execute("SELECT cid, bucket FROM images"):
+        path = image_path(root, r["cid"])
+        if not path.is_file():
+            missing.append(r["cid"])
+            continue
+        if looks_complete(path.read_bytes()):
+            ok += 1
+            continue
+        # Never silently discard human work: if someone has labelled it, report
+        # it and let a person decide.
+        human = conn.execute(
+            "SELECT 1 FROM labels WHERE cid=? AND source='human' LIMIT 1", (r["cid"],)
+        ).fetchone()
+        (protected if human else bad).append(r["cid"])
+
+    print(f"complete    {ok:,}")
+    print(f"truncated   {len(bad):,}")
+    print(f"file gone   {len(missing):,}")
+    if protected:
+        print(f"truncated but human-labelled  {len(protected):,}  (left alone -- "
+              f"re-review these by hand)")
+    if not bad and not missing:
+        print("\nnothing to repair")
+        return
+
+    if not args.repair:
+        print("\nre-run with --repair to delete these rows so a fresh harvest "
+              "re-fetches them")
+        return
+
+    for cid in bad + missing:
+        image_path(root, cid).unlink(missing_ok=True)
+        for table, col in (("labels", "cid"), ("review_state", "cid"),
+                           ("splits", "cid"), ("model_scores", "image_cid"),
+                           ("images", "cid")):
+            conn.execute(f"DELETE FROM {table} WHERE {col} = ?", (cid,))
+    conn.commit()
+    conn.close()
+    print(f"\nremoved {len(bad) + len(missing):,} rows. Re-run harvest to refetch them.")
+
+
 def export(args: argparse.Namespace) -> None:
     conn = connect(args.db)
     conn.row_factory = sqlite3.Row
@@ -415,6 +506,12 @@ def main() -> None:
 
     s = sub.add_parser("stats", help="what the manifest currently holds")
     s.set_defaults(fn=stats)
+
+    v = sub.add_parser("verify", help="find truncated images already in the manifest")
+    v.add_argument("--images", default=str(Path(__file__).parent / "data" / "images"))
+    v.add_argument("--repair", action="store_true",
+                   help="delete the bad rows so a fresh harvest refetches them")
+    v.set_defaults(fn=verify)
 
     e = sub.add_parser("export", help="emit a JSONL review queue")
     e.add_argument("--bucket", choices=["random", "fired", "uncertain", "multi-candidate"])
