@@ -37,13 +37,25 @@
   /* ── sweep ── */
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
           gap: 8px; }
-  .cell { position: relative; aspect-ratio: 1; border-radius: 6px; overflow: hidden;
+  .cell { position: relative; aspect-ratio: 3 / 4; border-radius: 6px; overflow: hidden;
           border: 2px solid var(--border); cursor: pointer; background: var(--surface); }
   /* Anchor to the top: screenshots are tall, and the platform chrome along the
      top edge is the single most diagnostic region. Centre-cropping a phone
-     screenshot to a square throws away exactly the part being judged. */
+     screenshot throws away exactly the part being judged.
+     `whole` shows the entire image letterboxed instead, for when the crop is
+     cutting off what you need to see. */
   .cell img { width: 100%; height: 100%; object-fit: cover; object-position: top;
               display: block; }
+  .grid.whole .cell img { object-fit: contain; object-position: center;
+                          background: #0a0c10; }
+
+  /* Hover preview: the whole image, uncropped, without leaving the grid. */
+  #peek { position: fixed; top: 50%; transform: translateY(-50%); z-index: 50;
+          display: none; pointer-events: none; padding: 6px; border-radius: 10px;
+          background: var(--surface); border: 1px solid var(--accent);
+          box-shadow: 0 12px 40px rgba(0,0,0,.6); }
+  #peek img { display: block; max-height: 86vh; max-width: 42vw; border-radius: 5px; }
+  #peek.left { left: 12px; } #peek.right { right: 12px; }
   .cell.on { border-color: var(--yellow); }
   .cell.on::after { content: "screenshot"; position: absolute; inset: auto 0 0 0;
                     background: var(--yellow); color: #000; font-size: 10px;
@@ -109,6 +121,9 @@
     <button id="m-sweep" class="on" onclick="setMode('sweep')">Sweep</button>
     <button id="m-detail" onclick="setMode('detail')">Detail</button>
   </div>
+  <div class="modes">
+    <button id="fit-toggle" onclick="toggleFit()" title="how thumbnails are cropped">Fill</button>
+  </div>
   <select id="bucket" onchange="load()">
     <option value="">all buckets</option>
     <option value="random">random</option>
@@ -129,6 +144,7 @@
 
 <footer id="footer"></footer>
 <div id="toast"></div>
+<div id="peek"><img alt=""></div>
 
 <script>
 let MODE = 'sweep', CFG = null, ITEMS = [], MARKED = new Set(), CUR = 0, SEL = new Set();
@@ -184,7 +200,8 @@ function renderSweep() {
     $('#footer').innerHTML = ''; return; }
 
   $('#main').innerHTML = `<div class="grid">${ITEMS.map((it, i) => `
-    <div class="cell" data-cid="${it.cid}" onclick="toggleCell(this)">
+    <div class="cell" data-cid="${it.cid}" onclick="toggleCell(this)"
+         onmouseenter="peekOn(this,'${it.cid}')" onmouseleave="peekOff()">
       <span class="idx">${i + 1}</span>
       <img src="/api/image/${it.cid}" loading="lazy" alt="">
     </div>`).join('')}</div>`;
@@ -195,8 +212,35 @@ function renderSweep() {
     <button class="act" onclick="doUndo()">Undo <kbd>u</kbd></button>
     <span class="hint">Click every image that <b>is</b> a screenshot.
       Everything left unclicked is recorded as <b>negative</b>.
-      <kbd>↵</kbd> confirm · <kbd>u</kbd> undo</span>`;
+      <kbd>↵</kbd> confirm · <kbd>u</kbd> undo · <kbd>f</kbd> fill/whole ·
+      hover any image to see it uncropped</span>`;
+  applyFit();
 }
+
+let FIT = localStorage.getItem('xblock-fit') || 'fill';
+
+function applyFit() {
+  const g = document.querySelector('.grid');
+  if (g) g.classList.toggle('whole', FIT === 'whole');
+  const b = document.getElementById('fit-toggle');
+  if (b) { b.textContent = FIT === 'whole' ? 'Whole' : 'Fill'; b.classList.toggle('on', FIT === 'whole'); }
+}
+function toggleFit() {
+  FIT = FIT === 'whole' ? 'fill' : 'whole';
+  try { localStorage.setItem('xblock-fit', FIT); } catch (e) {}
+  applyFit();
+}
+
+// Hover shows the full image so an ambiguous thumbnail can be resolved without
+// clicking through or changing the crop for everything.
+function peekOn(el, cid) {
+  const p = document.getElementById('peek');
+  p.querySelector('img').src = `/api/image/${cid}`;
+  const onLeft = el.getBoundingClientRect().left > window.innerWidth / 2;
+  p.className = onLeft ? 'left' : 'right';
+  p.style.display = 'block';
+}
+function peekOff() { document.getElementById('peek').style.display = 'none'; }
 
 function toggleCell(el) {
   const cid = el.dataset.cid;
@@ -318,6 +362,7 @@ document.addEventListener('keydown', e => {
 
   if (k === 'enter') { e.preventDefault(); MODE === 'sweep' ? submitSweep() : saveDetail(); return; }
   if (k === 'u') { e.preventDefault(); doUndo(); return; }
+  if (k === 'f') { e.preventDefault(); toggleFit(); return; }
   if (MODE !== 'detail') return;
 
   if (k === 's') { e.preventDefault(); skip(); return; }
