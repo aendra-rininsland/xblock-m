@@ -188,6 +188,23 @@ from a moderator's, and it works across the whole history. `modTool.meta.isAutom
 is Ozone's own field for this and `moderate.py` now sets it, but older events
 predate it.
 
+### Repairing content-hash ids
+
+```bash
+python import_corpus.py --fix-cids            # dry run
+python import_corpus.py --fix-cids --apply
+```
+
+An import that ran while `datasets` was hiding the filename produced `sha256…`
+ids instead of blob cids. Those never match an Ozone event, never deduplicate
+against a harvested copy, and never match `conflict_resolutions.json`.
+
+The blob cid **cannot** be recomputed from the stored bytes — the corpus holds
+CDN renditions, not the original blobs, so their content hash differs. It is
+recovered instead by re-deriving the same fallback key from the snapshot and
+mapping it back to the filename. Rewriting happens in place, so splits, review
+state and sweep decisions survive; a delete-and-reimport would destroy all three.
+
 ### Applying decisions after the fact
 
 ```bash
