@@ -48,6 +48,21 @@ const jetstream = new Jetstream({
   wantedCollections: ["app.bsky.feed.post"],
 });
 
+// Jetstream is an EventEmitter, so an 'error' event with no listener is not a
+// logged warning -- Node rethrows it as an uncaught exception and the process
+// dies. Every transient Jetstream websocket blip was therefore killing the
+// consumer: 31 restarts in 41 hours as measured on 2 September 2026, each one a
+// gap in firehose consumption.
+//
+// The reconnect already exists. @skyware/jetstream wraps ReconnectingWebSocket,
+// which backs off and reconnects on its own -- but only if the process survives
+// long enough to let it. Handling the event is the whole fix.
+//
+// This does not weaken the dead man's switch above: a socket that reconnects
+// but delivers nothing still trips the 5-minute idle check and still exits for
+// pm2. What changes is that a blip is no longer indistinguishable from death.
+jetstream.on("error", (e) => console.error("[firehose] jetstream error:", e));
+
 class Batch {
   items: CommitCreateEvent<"app.bsky.feed.post">[] = [];
   max = 5;

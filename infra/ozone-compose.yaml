@@ -1,0 +1,82 @@
+# Ozone stack for the new host. Adapted from /ozone/compose.yaml on the t2.large.
+#
+# Two deliberate differences from the original, both about not changing
+# underneath you:
+#
+# 1. IMAGES ARE PINNED BY DIGEST. The original tracks :latest.
+# 2. WATCHTOWER IS GONE. On the old box it runs @midnight with
+#    WATCHTOWER_LABEL_ENABLE, and ozone, ozone_news and caddy all carry the
+#    enable label -- so the moderation service pulls and restarts itself
+#    nightly, unreviewed. Ozone owns this database's schema, so an unattended
+#    update can migrate it while nobody is watching. Postgres was never
+#    labelled, which is the only reason this has been survivable.
+#
+#    Update deliberately instead: bump the digest below, `docker compose pull`,
+#    `docker compose up -d`, and watch the label stream come back.
+#
+# Everything else -- host networking, the bind mounts, the env_file layout --
+# is kept identical, because the cutover should change the machine and nothing
+# else. Copy /ozone/{ozone,ozone_news,postgres}.env across verbatim; they hold
+# the signing key and admin credentials and should never be printed or
+# reconstructed by hand.
+
+services:
+  caddy:
+    container_name: caddy
+    # Pin: caddy terminates TLS for xblock.aendra.dev.
+    image: caddy:2.8.4
+    network_mode: host
+    depends_on:
+      - ozone
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: /ozone/caddy/data
+        target: /data
+      - type: bind
+        source: /ozone/caddy/etc/caddy
+        target: /etc/caddy
+
+  ozone:
+    container_name: ozone
+    # Digest of ghcr.io/bluesky-social/ozone:latest as running on 2026-09-02.
+    # Multi-arch: this manifest list has an arm64 entry, which is what makes
+    # the move to Ampere possible without a rebuild.
+    image: ghcr.io/bluesky-social/ozone@sha256:4473001d2c22edef278a84a7714c93f52b4884669144bdcfef0f270befdd21d7
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - /ozone/ozone.env
+
+  ozone_news:
+    container_name: ozone_news
+    image: ghcr.io/bluesky-social/ozone@sha256:4473001d2c22edef278a84a7714c93f52b4884669144bdcfef0f270befdd21d7
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - /ozone/ozone_news.env
+
+  postgres:
+    container_name: postgres
+    # Same minor version as the source. A dump restored into a different major
+    # would be fine, but matching means the cutover tests one variable, not two.
+    image: postgres:14.11-bookworm
+    network_mode: host
+    restart: unless-stopped
+    healthcheck:
+      test: pg_isready -h localhost -U $$POSTGRES_USER
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - type: bind
+        source: /ozone/postgres
+        target: /var/lib/postgresql/data
+    env_file:
+      - /ozone/postgres.env
