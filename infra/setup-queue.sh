@@ -7,7 +7,9 @@
 # Idempotent: safe to re-run while iterating.
 set -euo pipefail
 
-REPO="${REPO:-https://github.com/aendra-rininsland/xblock-docker.git}"
+# Canonical name: xblock-docker 301s here, and git cannot follow that redirect
+# on clone -- it prompts for a username, which looks like a private repo.
+REPO="${REPO:-https://github.com/aendra-rininsland/xblock-m.git}"
 APP_USER=xblock
 APP_HOME=/home/$APP_USER
 APP_DIR=$APP_HOME/xblock-m

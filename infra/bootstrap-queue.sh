@@ -14,7 +14,8 @@ set -uo pipefail
 APP_USER=xblock
 APP_HOME=/home/$APP_USER
 APP_DIR=$APP_HOME/xblock-m
-REPO="${REPO:-https://github.com/aendra-rininsland/xblock-docker.git}"
+# Canonical name (xblock-docker 301s here). The repo is PUBLIC.
+REPO="${REPO:-https://github.com/aendra-rininsland/xblock-m.git}"
 BRANCH="${BRANCH:-feat/infra-migration}"
 WG_NET=10.10.0
 NODE_MAJOR=22
@@ -121,6 +122,18 @@ EOF
     chmod 600 /etc/wireguard/wg0.conf /etc/wireguard/server-private.key
 fi
 systemctl enable --now wg-quick@wg0 >/dev/null 2>&1 || true
+
+# ── git over HTTP/1.1 ──────────────────────────────────────────────────────
+# Ubuntu 24.04 ships git 2.43.0 against libcurl 8.5.0 + nghttp2 1.59.0, and
+# that combination mis-frames GitHub's smart-HTTP ref advertisement over HTTP/2.
+# git reports:
+#     fatal: expected flush after ref listing
+#     fatal: could not read Username for 'https://github.com'
+# The username prompt is a FALLBACK after the parse failure, not an auth
+# problem -- the repo is public and plain curl fetches the same URL fine over
+# HTTP/2. Without this pin, provisioning looks like a private-repo issue and
+# sends you hunting for deploy keys that were never needed.
+git config --system http.version HTTP/1.1
 
 # ── application ────────────────────────────────────────────────────────────
 if [ ! -d "$APP_DIR" ]; then
