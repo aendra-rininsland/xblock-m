@@ -292,6 +292,30 @@ the closest thing to a production false-positive rate the split can give. Note i
 is optimistic: the test split is ~4x negative where production is ~27x, so the
 real rate is several times higher.
 
+## Publishing a model
+
+```bash
+python publish.py --weights ./swin_s3_base_224-xblockm-timm --eval retrained.json --dry-run
+python publish.py --weights ./swin_s3_base_224-xblockm-timm --eval retrained.json --yes
+```
+
+The notebook publishes from *inside* `train()`, so there is no way to re-publish
+weights that already exist — re-running that cell retrains from scratch and, GPU
+work not being bit-for-bit deterministic, produces a **different model from the
+one you evaluated**. This publishes an existing checkpoint, so the artefact that
+was scored is the artefact that goes live.
+
+It writes the real preprocessing into the published config. timm carries the base
+model's `pretrained_cfg` forward, which for `swin_s3_base_224.ms_in1k` claims
+ImageNet mean/std — not what this model was trained with. Anything deriving a
+transform from the hub config would silently mis-normalise every image.
+
+Passing `--eval` records the metrics in the model card, so the published model
+carries its own evidence.
+
+Publishing replaces what the live worker loads on its next restart, so `--yes` is
+required and a mismatched class count is refused.
+
 ## Schema
 
 - `images` — one row per distinct image. `cid` is a content hash, so byte-identical
