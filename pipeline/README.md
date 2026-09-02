@@ -326,6 +326,11 @@ python publish.py --weights ./swin_s3_base_224-xblockm-timm --eval retrained.jso
 python publish.py --weights ./swin_s3_base_224-xblockm-timm --eval retrained.json --yes
 ```
 
+Needs only `huggingface_hub` — no torch, no timm — so it runs from any machine
+that can reach the Hub rather than only one set up for training. The class count
+is read straight from the safetensors header, and `config.json` is written by
+hand.
+
 The notebook publishes from *inside* `train()`, so there is no way to re-publish
 weights that already exist — re-running that cell retrains from scratch and, GPU
 work not being bit-for-bit deterministic, produces a **different model from the
