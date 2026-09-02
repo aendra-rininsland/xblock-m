@@ -20,7 +20,7 @@ from io import BytesIO
 from PIL import Image
 from safetensors.torch import load_file
 from timm import create_model
-from constants import MAX_JOB_AGE_MS, THRESHOLD
+from constants import MAX_JOB_AGE_MS, THRESHOLD, threshold_for
 from preprocessing import IMG_SIZE, build_transform
 from moderate import auth_client, create_label
 
@@ -412,7 +412,7 @@ async def process_request(job, token):
             if image_result.get("error"):
                 errors += 1
             for label, score in image_result.get("labels", {}).items():
-                if label != "negative" and float(score) >= THRESHOLD:
+                if label != "negative" and float(score) >= threshold_for(label):
                     hits += 1
         # One event per post. _emit_label re-derives the full label set from the
         # result itself, so calling it once per matching label emitted the same

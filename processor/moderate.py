@@ -7,7 +7,7 @@ from atproto import AsyncClient
 from atproto_client.exceptions import BadRequestError, UnauthorizedError
 from dotenv import load_dotenv
 
-from constants import THRESHOLD
+from constants import THRESHOLD, threshold_for
 from label_values import LABEL_VALUES
 
 load_dotenv()
@@ -133,7 +133,7 @@ async def _emit_label(result: dict) -> None:
     add_labels = []
     for image in result["image_results"]:
         for label, score in image.get("labels", {}).items():
-            if float(score) < THRESHOLD:
+            if float(score) < threshold_for(label):
                 continue
             if label not in LABEL_VALUES:
                 # A checkpoint predicting a class the serving side has never

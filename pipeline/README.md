@@ -292,6 +292,33 @@ the closest thing to a production false-positive rate the split can give. Note i
 is optimistic: the test split is ~4x negative where production is ~27x, so the
 real rate is several times higher.
 
+## Per-class thresholds
+
+```bash
+python evaluate.py --weights ./ckpt --tune-thresholds --write-constants thresholds.py
+```
+
+One global threshold across twelve classes assumes they are equally
+well-separated, and they are not. At 0.8 the model produced **zero predictions**
+for most classes while their average precision sat well above chance — the
+ranking was fine, the gate was in the wrong place.
+
+Fitting happens on the **val** split, never test: tuning on the set you judge by
+is the same mistake as training on it, and val has otherwise gone unused. For
+each class it takes the *lowest* threshold still meeting the precision target,
+since anything higher costs recall for nothing.
+
+A class with fewer than 5 validation positives is **left at the global
+threshold**. A threshold fitted to three images is noise dressed as a decision.
+
+The report shows what each tuned threshold then does on **test**, which is the
+honest check — if test precision falls well short of val precision, the threshold
+is overfitted to a small val set.
+
+`--write-constants` emits a `CLASS_THRESHOLDS` map to paste into
+`processor/constants.py`; `threshold_for()` falls back to `THRESHOLD` for
+anything absent.
+
 ## Publishing a model
 
 ```bash

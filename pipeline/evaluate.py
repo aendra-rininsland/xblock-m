@@ -71,10 +71,11 @@ def load_model(weights: str | None, hub: str | None, num_classes: int):
     return model
 
 
-def score(model, db: str, images: str, split: str, batch_size: int) -> dict:
+def raw_scores(model, db: str, images: str, split: str, batch_size: int):
+    """(y_true, y_score) over a split. Shared by scoring and threshold tuning so
+    both see exactly the same numbers."""
     import numpy as np
     import torch
-    from sklearn.metrics import average_precision_score, roc_auc_score
 
     from dataset import load_manifest_dataset
     from preprocessing import build_transform
@@ -92,8 +93,18 @@ def score(model, db: str, images: str, split: str, batch_size: int) -> dict:
             probs = model(batch).sigmoid().float().cpu().numpy()
         scores.append(probs)
         targets.append(np.asarray(rows["labels"], dtype=float))
-    y_score = np.concatenate(scores)
-    y_true = np.concatenate(targets)
+    return np.concatenate(targets), np.concatenate(scores)
+
+
+def score(model, db: str, images: str, split: str, batch_size: int,
+          thresholds: dict | None = None) -> dict:
+    import numpy as np
+    from sklearn.metrics import average_precision_score, roc_auc_score
+
+    y_true, y_score = raw_scores(model, db, images, split, batch_size)
+
+    def thr(c):
+        return (thresholds or {}).get(c, THRESHOLD)
 
     per = {}
     for i, name in enumerate(CLASSES):
@@ -101,12 +112,13 @@ def score(model, db: str, images: str, split: str, batch_size: int) -> dict:
         if support == 0:
             per[name] = {"n": 0, "ap": None, "precision": None, "recall": None}
             continue
-        pred = (y_score[:, i] >= THRESHOLD).astype(int)
+        pred = (y_score[:, i] >= thr(name)).astype(int)
         tp = int(((y_true[:, i] == 1) & (pred == 1)).sum())
         fp = int(((y_true[:, i] == 0) & (pred == 1)).sum())
         fn = int(((y_true[:, i] == 1) & (pred == 0)).sum())
         per[name] = {
             "n": support,
+            "threshold": thr(name),
             "ap": float(average_precision_score(y_true[:, i], y_score[:, i])),
             "precision": tp / (tp + fp) if tp + fp else 0.0,
             "recall": tp / (tp + fn) if tp + fn else 0.0,
@@ -123,12 +135,87 @@ def score(model, db: str, images: str, split: str, batch_size: int) -> dict:
     neg_i = CLASSES.index("negative")
     plat = [i for i in range(len(CLASSES)) if i != neg_i]
     is_neg = y_true[:, neg_i] == 1
-    fired = (y_score[:, plat] >= THRESHOLD).any(axis=1)
+    fired = np.zeros(len(y_score), dtype=bool)
+    for i in plat:
+        fired |= y_score[:, i] >= thr(CLASSES[i])
     fp_rate = float((is_neg & fired).sum() / max(is_neg.sum(), 1))
 
-    return {"split": split, "images": int(len(ds)), "threshold": THRESHOLD,
+    return {"split": split, "images": int(len(y_true)), "threshold": THRESHOLD,
+            "thresholds": {c: thr(c) for c in CLASSES},
             "micro_roc_auc": micro, "macro_ap": float(np.mean(aps)) if aps else None,
             "fp_rate_on_negatives": fp_rate, "per_class": per}
+
+
+MIN_TO_TUNE = 5      # positives in val below which a class is left alone
+
+
+def tune(model, db: str, images: str, batch_size: int, target_precision: float,
+         min_support: int = MIN_TO_TUNE) -> dict:
+    """Pick a per-class threshold on the VALIDATION split.
+
+    Tuning on test would fit the operating point to the set used to judge the
+    result, which is the same mistake as training on it. val exists for exactly
+    this and has otherwise gone unused.
+
+    For each class, take the LOWEST threshold whose precision still meets the
+    target -- lowest because everything above it costs recall for no gain in
+    precision, and recall is what a single global 0.8 has been destroying.
+
+    A class with too few validation positives is left at the global threshold. A
+    threshold fitted to three images is noise dressed as a decision.
+    """
+    import numpy as np
+
+    y_true, y_score = raw_scores(model, db, images, "val", batch_size)
+    grid = np.round(np.arange(0.05, 1.00, 0.01), 2)
+    out, notes = {}, {}
+
+    for i, name in enumerate(CLASSES):
+        if name == "negative":
+            continue
+        pos = y_true[:, i]
+        support = int(pos.sum())
+        if support < min_support:
+            notes[name] = f"only {support} in val, left at {THRESHOLD}"
+            continue
+
+        best = None
+        for t in grid:
+            pred = y_score[:, i] >= t
+            tp = int((pred & (pos == 1)).sum())
+            fp = int((pred & (pos == 0)).sum())
+            fn = int((~pred & (pos == 1)).sum())
+            if tp == 0:
+                continue
+            prec, rec = tp / (tp + fp), tp / (tp + fn)
+            if prec >= target_precision:
+                best = (float(t), prec, rec)
+                break           # grid ascends, so the first hit is the lowest
+        if best is None:
+            notes[name] = f"cannot reach {target_precision:.0%} precision in val"
+            continue
+        out[name] = best[0]
+        notes[name] = f"val precision {best[1]:.2f}, recall {best[2]:.2f}"
+    return {"thresholds": out, "notes": notes, "target_precision": target_precision}
+
+
+def show_tuning(t: dict, before: dict, after: dict) -> None:
+    print(f"\ntuned on the val split for >= {t['target_precision']:.0%} precision")
+    print(f"\n  {'class':<13}{'thr':>6}{'test recall':>14}{'test prec':>11}   note")
+    for name in CLASSES:
+        if name == "negative":
+            continue
+        thr = t["thresholds"].get(name, THRESHOLD)
+        b, a = before["per_class"][name], after["per_class"][name]
+        if b["ap"] is None:
+            continue
+        arrow = f"{b['recall']:.2f} -> {a['recall']:.2f}"
+        mark = "  <-" if a["recall"] > b["recall"] + 1e-9 else ""
+        print(f"  {name:<13}{thr:>6.2f}{arrow:>14}{a['precision']:>11.2f}"
+              f"   {t['notes'].get(name, '')}{mark}")
+    print(f"\n  macro AP is unchanged by thresholds -- AP is threshold-free.")
+    print(f"  FP rate on negatives  {before['fp_rate_on_negatives']*100:.2f}% -> "
+          f"{after['fp_rate_on_negatives']*100:.2f}%")
 
 
 def show(r: dict, title: str = "") -> None:
@@ -186,6 +273,12 @@ def main() -> None:
     p.add_argument("--json", help="write the result here, for --compare later")
     p.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"),
                    help="diff two saved results instead of scoring")
+    p.add_argument("--tune-thresholds", action="store_true",
+                   help="fit a per-class threshold on val, then report it on test")
+    p.add_argument("--target-precision", type=float, default=0.95,
+                   help="precision each tuned class must still reach (default 0.95)")
+    p.add_argument("--write-constants", metavar="PATH",
+                   help="write the tuned map as a python snippet for constants.py")
     args = p.parse_args()
 
     if args.compare:
@@ -200,6 +293,28 @@ def main() -> None:
         sys.exit("pass --weights or --hub (or --compare two saved results)")
 
     model = load_model(args.weights, args.hub, len(CLASSES))
+
+    if args.tune_thresholds:
+        t = tune(model, args.db, args.images, args.batch_size, args.target_precision)
+        before = score(model, args.db, args.images, "test", args.batch_size)
+        after = score(model, args.db, args.images, "test", args.batch_size,
+                      thresholds=t["thresholds"])
+        show_tuning(t, before, after)
+        if args.write_constants:
+            body = "\n".join(f'    "{k}": {v:.2f},'
+                              for k, v in sorted(t["thresholds"].items()))
+            Path(args.write_constants).write_text(
+                "# Fitted by evaluate.py --tune-thresholds on the val split,\n"
+                f"# for >= {args.target_precision:.0%} precision per class.\n"
+                "# Classes absent here fall back to THRESHOLD.\n"
+                f"CLASS_THRESHOLDS = {{\n{body}\n}}\n")
+            print(f"\nwrote {args.write_constants}")
+        if args.json:
+            Path(args.json).write_text(json.dumps(
+                {"tuning": t, "test_before": before, "test_after": after}, indent=2) + "\n")
+            print(f"wrote {args.json}")
+        return
+
     r = score(model, args.db, args.images, args.split, args.batch_size)
     r["source"] = args.hub or args.weights
     show(r, f"{r['source']}")
