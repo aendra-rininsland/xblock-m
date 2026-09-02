@@ -18,6 +18,10 @@ base model's pretrained_cfg forward, which for swin_s3_base_224.ms_in1k says
 ImageNet mean/std -- not what this model was trained with. Anything deriving a
 transform from the hub config would silently mis-normalise every image.
 
+Needs only huggingface_hub -- no torch, no timm. Publishing is a file operation,
+so it can run from any machine that can reach the Hub, not only one set up for
+training.
+
     python publish.py --weights ./swin_s3_base_224-xblockm-timm --dry-run
     python publish.py --weights ./swin_s3_base_224-xblockm-timm --yes
 """
@@ -35,6 +39,35 @@ from manifest import CLASSES  # noqa: E402
 
 DEFAULT_REPO = "swin_s3_base_224-xblockm-timm"
 ARCH = "swin_s3_base_224"
+
+# What the model was ACTUALLY trained with -- see processor/preprocessing.py.
+# timm carries swin_s3_base_224.ms_in1k's pretrained_cfg forward, which claims
+# ImageNet mean/std. Anything deriving a transform from the published config
+# would mis-normalise every image, so it is written explicitly here.
+#
+# The resize is an aspect-ratio squash, which timm's data config cannot express;
+# crop_pct 1.0 is the nearest approximation and serving code should mirror
+# preprocessing.py rather than derive a transform from this.
+PRETRAINED_CFG = {
+    "mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5],
+    "input_size": [3, 224, 224], "interpolation": "bilinear",
+    "crop_pct": 1.0, "tag": "xblockm",
+}
+
+
+def safetensors_header(path: Path) -> dict:
+    """Read a safetensors index without torch.
+
+    The format is an 8-byte little-endian header length followed by that many
+    bytes of JSON describing every tensor. Publishing is a file operation, so
+    there is no reason to load a 268 MB checkpoint into a framework just to
+    write it straight back out -- and requiring torch means publishing only
+    works on a machine set up for training.
+    """
+    import struct
+    with path.open("rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        return json.loads(f.read(n))
 
 
 def main() -> None:
@@ -77,44 +110,24 @@ def main() -> None:
         print(f"authenticated as {me.get('name')} (role: {role}"
               + (f", perms: {', '.join(sorted(perms))}" if perms else "") + ")")
 
-    import torch  # noqa: F401
-    from safetensors.torch import load_file
-    from timm import create_model
-
     path = Path(args.weights)
     f = path / "model.safetensors" if path.is_dir() else path
     if not f.is_file():
         sys.exit(f"no model.safetensors at {f}")
 
-    state = load_file(str(f))
-    head = state.get("head.fc.weight")
+    header = safetensors_header(f)
+    head = header.get("head.fc.weight")
     if head is None:
         sys.exit("checkpoint has no head.fc.weight -- is this a timm swin checkpoint?")
-    if head.shape[0] != len(CLASSES):
-        sys.exit(f"checkpoint has {head.shape[0]} classes, the manifest has "
+    n_classes = head["shape"][0]
+    if n_classes != len(CLASSES):
+        sys.exit(f"checkpoint has {n_classes} classes, the manifest has "
                  f"{len(CLASSES)}. Publishing this would put a model with the wrong "
                  f"class list in front of the worker.")
 
-    model = create_model(ARCH, num_classes=len(CLASSES), pretrained=False)
-    model.load_state_dict(state)
-    model.eval()
-
-    # What the model was ACTUALLY trained with. See processor/preprocessing.py.
-    # Note the resize is an aspect-ratio squash, which timm's data config cannot
-    # express -- crop_pct 1.0 is the nearest approximation, and serving code
-    # should mirror preprocessing.py rather than derive a transform from this.
-    model.pretrained_cfg.update({
-        "mean": (0.5, 0.5, 0.5),
-        "std": (0.5, 0.5, 0.5),
-        "input_size": (3, 224, 224),
-        "interpolation": "bilinear",
-        "crop_pct": 1.0,
-        "num_classes": len(CLASSES),
-        "tag": "xblockm",
-    })
-
     print(f"checkpoint   {f}")
-    print(f"architecture {ARCH}   classes {len(CLASSES)}")
+    print(f"architecture {ARCH}   classes {n_classes}   "
+          f"{f.stat().st_size/1048576:.0f} MB")
     print(f"classes      {', '.join(CLASSES)}")
     print(f"normalize    mean/std 0.5  (NOT the ImageNet values timm would infer)")
     print(f"target repo  howdyaendra/{args.repo}")
@@ -152,31 +165,40 @@ def main() -> None:
                 f"| class | n | AP | precision | recall |\n|---|---|---|---|---|\n{rows}\n"}
 
     from huggingface_hub import HfApi
-    from timm.models._hub import save_for_hf
 
     api = HfApi()
     repo_id = f"{api.whoami()['name']}/{args.repo}"
 
     # push_to_hf_hub calls create_repo(exist_ok=True) unconditionally, which a
-    # fine-grained token without repo-creation rights rejects with a 403 -- even
-    # when the repo already exists and the token can write to it. Only create
-    # when it is genuinely missing.
+    # fine-grained token without repo-creation rights rejects with a 403 even
+    # when the repo exists and the token can write to it.
     if api.repo_exists(repo_id):
-        print(f"repo exists, uploading without create")
+        print("repo exists, uploading without create")
     else:
-        print(f"repo does not exist, creating it")
+        print("repo does not exist, creating it")
         api.create_repo(repo_id, exist_ok=True)
+
+    config = {
+        "architecture": ARCH,
+        "num_classes": n_classes,
+        "num_features": head["shape"][1],
+        "global_pool": "avg",
+        "label_names": list(CLASSES),
+        "pretrained_cfg": {**PRETRAINED_CFG, "num_classes": n_classes},
+    }
 
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
-        save_for_hf(model, tmp, model_config=dict(label_names=list(CLASSES)),
-                    safe_serialization=True)
+        staging = Path(tmp)
+        (staging / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        (staging / "model.safetensors").symlink_to(f.resolve())
         if card:
-            (Path(tmp) / "README.md").write_text(card["description"])
-        api.upload_folder(repo_id=repo_id, folder_path=tmp,
-                          commit_message=f"xblock model, macro AP "
-                                         f"{metrics['macro_ap']:.3f}" if metrics
-                                         else "xblock model")
+            (staging / "README.md").write_text(card["description"])
+        api.upload_folder(
+            repo_id=repo_id, folder_path=str(staging),
+            commit_message=(f"xblock model, macro AP {metrics['macro_ap']:.3f}"
+                            if metrics else "xblock model"))
+
     print(f"\npublished to {repo_id}")
     print("Restart the worker to pick it up:")
     print("  supervisorctl -c /home/aendra/xblock-docker/supervisord.conf "
