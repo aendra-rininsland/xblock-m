@@ -47,6 +47,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,12 +60,29 @@ from manifest import (IMPORTED, NEEDS_DETAIL, connect, default_db,
 
 CDN = "https://cdn.bsky.app/img/feed_thumbnail/plain/{did}/{cid}@jpeg"
 
+# Reports carry no subjectBlobCids -- not sometimes, ever. Every one of the
+# 45,993 report events in the store has the column empty, because Ozone only
+# denormalises blob CIDs onto the events it creates from a label, not from a
+# user's report. The images are still recoverable: the report names the post in
+# `subjectUri`, and the post record itself lists its blobs. So resolve the record
+# through the AppView and read the CIDs off it.
+#
+# The public AppView needs no auth and takes 25 URIs per call, which is what
+# makes this practical -- ~39k reported posts is ~1.6k requests, not 39k.
+APPVIEW = "https://public.api.bsky.app/xrpc/app.bsky.feed.getPosts"
+GET_POSTS_MAX = 25          # the lexicon's own cap on `uris`
+
+# Only post records have blobs. Reports also target accounts (a bare DID) and the
+# occasional non-post record; neither resolves to an image.
+POST_URI = "at://%/app.bsky.feed.post/%"
+
 LABEL_EVENT = "tools.ozone.moderation.defs#modEventLabel"
 REPORT_EVENT = "tools.ozone.moderation.defs#modEventReport"
 APPEAL_REASONS = ("com.atproto.moderation.defs#reasonAppeal",
                   "tools.ozone.report.defs#reasonAppeal")
 
 # Buckets, so the review UI can work each kind of signal separately.
+B_CORRECTED = "ozone-corrected"  # a human removed a label AND supplied the right one
 B_MODEL = "ozone-model"        # the labeller fired; unverified
 B_HUMAN = "ozone-human"        # a moderator applied this by hand
 B_FP = "ozone-false-positive"  # a human removed a label the model applied
@@ -173,6 +191,75 @@ QUERIES: dict[str, str] = {
 }
 
 
+def image_cids(embed) -> list[str]:
+    """Blob CIDs of the images on a post record.
+
+    Two embed shapes carry them: `app.bsky.embed.images` directly, and
+    `app.bsky.embed.recordWithMedia`, which nests the same structure under
+    `media`. A plain `app.bsky.embed.record` -- a quote post -- is deliberately
+    skipped: those images belong to the post being quoted, and a report is about
+    the post that was reported, not the one it points at."""
+    if not isinstance(embed, dict):
+        return []
+    kind = embed.get("$type") or ""
+    if kind.startswith("app.bsky.embed.recordWithMedia"):
+        return image_cids(embed.get("media"))
+    if not kind.startswith("app.bsky.embed.images"):
+        return []
+    cids = []
+    for img in embed.get("images") or []:
+        if not isinstance(img, dict):
+            continue
+        ref = (img.get("image") or {}).get("ref")
+        link = ref.get("$link") if isinstance(ref, dict) else ref
+        if isinstance(link, str) and link:
+            cids.append(link)
+    return cids
+
+
+def resolve_posts(session, uris: list[str], progress=True) -> dict[str, list[str]]:
+    """at:// post URIs -> their image blob CIDs, via the public AppView.
+
+    A URI absent from the response is a post that no longer resolves: deleted,
+    or in a repo that is no longer served. Over a backlog this old that is
+    routine, not an error, so it is counted rather than raised."""
+    out: dict[str, list[str]] = {}
+    total = (len(uris) + GET_POSTS_MAX - 1) // GET_POSTS_MAX
+    for n, i in enumerate(range(0, len(uris), GET_POSTS_MAX), start=1):
+        batch = uris[i:i + GET_POSTS_MAX]
+        for attempt in range(4):
+            try:
+                resp = session.get(APPVIEW, params={"uris": batch}, timeout=30)
+            except Exception:
+                time.sleep(2 * (attempt + 1))
+                continue
+            # The AppView is a shared public service; back off when it says to
+            # rather than hammering it through a 39k-post backlog.
+            if resp.status_code == 429:
+                wait = resp.headers.get("Retry-After")
+                time.sleep(int(wait) if (wait or "").isdigit() else 5 * (attempt + 1))
+                continue
+            if resp.status_code != 200:
+                break
+            try:
+                posts = resp.json().get("posts") or []
+            except ValueError:
+                break
+            for p in posts:
+                uri, rec = p.get("uri"), p.get("record")
+                if isinstance(uri, str) and isinstance(rec, dict):
+                    cids = image_cids(rec.get("embed"))
+                    if cids:
+                        out[uri] = cids
+            break
+        if progress and (n % 20 == 0 or n == total):
+            print(f"  resolving posts via AppView: {n}/{total} batches, "
+                  f"{len(out):,} with images", end="\r", flush=True)
+    if progress and total:
+        print()
+    return out
+
+
 def fetch_image(session, did: str, cid: str) -> bytes | None:
     try:
         r = session.get(CDN.format(did=did, cid=cid), timeout=20)
@@ -195,6 +282,11 @@ def main() -> None:
     p.add_argument("--limit", type=int, default=20000, help="per signal kind")
     p.add_argument("--kinds", default=",".join(QUERIES),
                    help="comma-separated subset of: " + ", ".join(QUERIES))
+    p.add_argument("--resolve-blobs", action="store_true",
+                   help="for events with no subjectBlobCids, resolve the post "
+                        "record through the AppView and read its blob CIDs. "
+                        "This is the only way to get images out of reports, "
+                        "which never carry blob CIDs of their own.")
     p.add_argument("--dry-run", action="store_true",
                    help="report without writing (this is the default)")
     p.add_argument("--apply", action="store_true", help="write (default is a dry run)")
@@ -227,6 +319,8 @@ def main() -> None:
 
     # cid -> what we know about it, merged across signal kinds
     found: dict[str, dict] = {}
+    # post uri -> what we know, for events whose blob CIDs have to be resolved
+    deferred: dict[str, dict] = {}
     counts: Counter = Counter()
 
     with psycopg.connect(args.dsn) as conn:
@@ -238,9 +332,6 @@ def main() -> None:
                 for row in cur.fetchall():
                     r = {k: as_text(v) for k, v in zip(cols, row)}
                     cids = blob_cids(r.get("subjectBlobCids"))
-                    if not cids:
-                        counts[f"{kind}:no-blobs"] += 1
-                        continue
                     labels = classes_from(split_vals(r.get("createLabelVals")))
                     # An appeal is a report with an appeal reasonType. It is the
                     # strongest false-positive evidence available, so separate it
@@ -248,6 +339,22 @@ def main() -> None:
                     effective = kind
                     if kind == B_REPORT and report_type(r.get("meta")) in APPEAL_REASONS:
                         effective = B_APPEAL
+                    if not cids:
+                        # No blob CIDs on the event. If the subject is a post
+                        # record the images are still reachable through the
+                        # AppView, so hold the URI back for a second pass rather
+                        # than dropping the event on the floor.
+                        uri = r.get("subjectUri") or ""
+                        if args.resolve_blobs and uri.startswith("at://") \
+                                and "/app.bsky.feed.post/" in uri:
+                            e = deferred.setdefault(uri, {"kinds": set(), "labels": set()})
+                            e["kinds"].add(effective)
+                            if kind in (B_MODEL, B_HUMAN):
+                                e["labels"].update(labels)
+                            counts[f"{effective}:deferred"] += 1
+                        else:
+                            counts[f"{kind}:no-blobs"] += 1
+                        continue
                     for cid in cids:
                         entry = found.setdefault(cid, {
                             "did": r["subjectDid"], "uri": r["subjectUri"],
@@ -256,6 +363,36 @@ def main() -> None:
                         if kind in (B_MODEL, B_HUMAN):
                             entry["labels"].update(labels)
                     counts[effective] += 1
+
+    # Second pass: turn the deferred post URIs into blob CIDs. This is what makes
+    # reports usable at all -- without it the report bucket yields exactly zero
+    # images, however high --limit is set.
+    if deferred:
+        import requests as _requests
+        print(f"resolving {len(deferred):,} post records through the AppView "
+              f"(no blob CIDs on the event)...")
+        resolver = _requests.Session()
+        resolved = resolve_posts(resolver, list(deferred))
+        resolver.close()
+        gained = 0
+        for uri, e in deferred.items():
+            cids = resolved.get(uri)
+            if not cids:
+                # Either the post is gone, or it never had images -- a report on
+                # a text-only post is still a real report, just not training data.
+                counts["resolve:no-images"] += 1
+                continue
+            did = uri.split("/")[2] if uri.count("/") >= 2 else ""
+            for cid in cids:
+                entry = found.setdefault(cid, {"did": did, "uri": uri,
+                                               "kinds": set(), "labels": set()})
+                entry["kinds"].update(e["kinds"])
+                entry["labels"].update(e["labels"])
+                gained += 1
+        for k in list(counts):
+            if k.endswith(":deferred"):
+                counts[k.removesuffix(":deferred")] += counts[k]
+        print(f"  resolved {len(resolved):,} posts -> {gained:,} image references")
 
     print(f"events matched: " + "  ".join(
         f"{k}={counts[k]:,}" for k in wanted) + f"\ndistinct images: {len(found):,}")
@@ -274,9 +411,22 @@ def main() -> None:
     by_bucket: Counter = Counter()
 
     for cid, e in found.items():
+        # A negation and a human's label are two different pieces of evidence
+        # about the same image, and only the negation is uninformative. When a
+        # moderator both removed a label and applied one -- in a single relabel
+        # event, or as a later correction on the same subject -- the second half
+        # is ground truth: not "X was wrong" but "it is actually Y".
+        #
+        # Without this, such an image falls into B_FP, whose whole point is that
+        # it carries no label, and the moderator's answer is thrown away. It then
+        # goes back to review so a human can supply the answer a human already
+        # gave. That is the single largest avoidable loss in this importer.
+        if B_FP in e["kinds"] and B_HUMAN in e["kinds"] and e["labels"]:
+            e["kinds"].add(B_CORRECTED)
+
         # Most specific signal wins the bucket: a false positive is more useful
         # to a reviewer than the fact that the model also labelled it.
-        for bucket in (B_FP, B_APPEAL, B_REPORT, B_HUMAN, B_MODEL):
+        for bucket in (B_CORRECTED, B_FP, B_APPEAL, B_REPORT, B_HUMAN, B_MODEL):
             if bucket in e["kinds"]:
                 break
         by_bucket[bucket] += 1
@@ -300,15 +450,23 @@ def main() -> None:
             (cid, e["did"], "", e["uri"], str(dest.relative_to(images_root)),
              len(raw), now, bucket))
 
-        # A negation says the label was wrong, not what is right, so a false
+        # A bare negation says the label was wrong, not what is right, so a false
         # positive carries no label at all -- a human decides what it actually is.
+        # B_CORRECTED is the exception, and deliberately not B_FP: there a human
+        # supplied the replacement, so the label written here is that human's.
         if bucket != B_FP:
             for label in sorted(e["labels"]):
                 source = "ozone-human" if B_HUMAN in e["kinds"] else "ozone-model"
                 conn_db.execute(
                     "INSERT OR REPLACE INTO labels (cid,label,source,created_at)"
                     " VALUES (?,?,?,?)", (cid, label, source, now))
-        state = NEEDS_DETAIL if bucket in (B_FP, B_REPORT, B_APPEAL) else IMPORTED
+        # Corrected images arrive WITH their label but still go to review. The
+        # corpus's guarantee is that a human confirmed every label in it, and a
+        # moderator's action in Ozone is not the same act as labelling for
+        # training -- so it is a confirm pass, not a free pass.
+        state = (NEEDS_DETAIL
+                 if bucket in (B_CORRECTED, B_FP, B_REPORT, B_APPEAL)
+                 else IMPORTED)
         conn_db.execute(
             "INSERT INTO review_state (cid,state,updated_at) VALUES (?,?,?) "
             "ON CONFLICT(cid) DO UPDATE SET state=excluded.state", (cid, state, now))
