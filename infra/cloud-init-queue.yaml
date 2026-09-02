@@ -42,7 +42,12 @@ write_files:
   - path: /etc/redis/redis.conf.d/xblock.conf
     permissions: "0640"
     content: |
-      bind 127.0.0.1 10.10.0.1
+      # The "-" prefix makes the bind OPTIONAL. 10.10.0.1 is the WireGuard
+      # address, which only exists once wg-quick@wg0 is up -- so without it,
+      # redis loses the boot race against WireGuard and exits 1. systemd does
+      # retry and it comes up on the second attempt, which hides the problem
+      # while leaving every reboot a coin flip. This makes it deterministic.
+      bind 127.0.0.1 -10.10.0.1
       protected-mode yes
       port 6379
 
@@ -80,11 +85,19 @@ runcmd:
   - ufw allow 51820/udp comment 'WireGuard'
   - ufw --force enable
 
-  # Redis on Ubuntu does not read a conf.d directory by default.
-  - sh -c 'grep -q "redis.conf.d" /etc/redis/redis.conf || echo "include /etc/redis/redis.conf.d/xblock.conf" >> /etc/redis/redis.conf'
+  # Redis on Ubuntu does not read a conf.d directory by default, and `include`
+  # takes ONE path with no glob expansion -- so each file needs its own line.
+  # setup-queue.sh/bootstrap-queue.sh add auth.conf; without its own include
+  # the generated requirepass is never applied and redis answers unauthenticated.
+  - sh -c 'grep -q "redis.conf.d/xblock.conf" /etc/redis/redis.conf || echo "include /etc/redis/redis.conf.d/xblock.conf" >> /etc/redis/redis.conf'
   - systemctl enable --now redis-server
 
   - systemctl enable --now fail2ban
-  - sh -c 'echo "queue box base provision complete: $(date -u)" > /var/log/xblock-provision.log'
+  # Use the list form for anything containing ": ". As a bare YAML scalar, a
+  # colon-space turns the entry into a mapping, cloud-init's shellify() rejects
+  # the dict, and the WHOLE runcmd block aborts before running a single command
+  # -- so ufw and redis silently never start while the packages install fine.
+  # That failure looked like a Hetzner problem and was not.
+  - ["sh", "-c", "echo \"queue box base provision complete: $(date -u)\" > /var/log/xblock-provision.log"]
 
 final_message: "xblock-queue base ready after $UPTIME s. Run setup-queue.sh next."

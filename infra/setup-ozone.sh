@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ozone host provision. Run on a fresh CAX21 (Ubuntu 24.04, arm64) as root.
+# Ozone host provision. Run on a fresh Ubuntu 24.04 box (arm64 or x86_64) as root.
 #
 #   ssh -i ~/.ssh/xblock-hetzner root@<ip> 'bash -s' < infra/setup-ozone.sh
 #
@@ -21,7 +21,12 @@ if ! command -v docker >/dev/null 2>&1; then
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
         | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.gpg] \
+    # Derive the architecture rather than pinning it. ARM was the original
+    # target, but Ampere capacity is scarce across European providers (Hetzner
+    # restricted since June 2026, netcup ARM sold out), so this has to work on
+    # x86 too. Nothing in the stack needs ARM -- ozone, postgres and caddy are
+    # all multi-arch and it was only ever a price/performance preference.
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
 https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
         > /etc/apt/sources.list.d/docker.list
     apt-get update

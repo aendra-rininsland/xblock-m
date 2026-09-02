@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot bootstrap for a BARE Ubuntu 24.04 arm64 box, run as root over SSH.
+# One-shot bootstrap for a BARE Ubuntu 24.04 box (arm64 or x86_64), as root.
 #
 # Does everything cloud-init-queue.yaml + setup-queue.sh do combined, so the
 # server can be created by hand in the Hetzner console with no user-data pasted
@@ -67,7 +67,11 @@ ufw --force enable >/dev/null
 log "redis config"
 mkdir -p /etc/redis/redis.conf.d
 cat > /etc/redis/redis.conf.d/xblock.conf <<EOF
-bind 127.0.0.1 ${WG_NET}.1
+# The "-" prefix makes the bind OPTIONAL. The WireGuard address only exists
+# once wg-quick@wg0 is up, so without it redis loses the boot race and exits 1.
+# systemd retries and it comes up second time, which hides the problem while
+# leaving every reboot a coin flip.
+bind 127.0.0.1 -${WG_NET}.1
 protected-mode yes
 port 6379
 
@@ -83,8 +87,15 @@ maxmemory-policy noeviction
 save ""
 appendonly no
 EOF
-grep -q "redis.conf.d" /etc/redis/redis.conf || \
+# Redis `include` takes ONE path and does not expand globs, so every file in
+# conf.d needs its own line. Including only xblock.conf silently leaves
+# auth.conf unread -- requirepass is generated, written, and never applied, and
+# `redis-cli ping` answers PONG to anyone who reaches the port. Verify with
+# `redis-cli ping` expecting NOAUTH, not by reading the config.
+grep -q "redis.conf.d/xblock.conf" /etc/redis/redis.conf || \
     echo "include /etc/redis/redis.conf.d/xblock.conf" >> /etc/redis/redis.conf
+grep -q "redis.conf.d/auth.conf" /etc/redis/redis.conf || \
+    echo "include /etc/redis/redis.conf.d/auth.conf" >> /etc/redis/redis.conf
 
 if [ ! -f /etc/redis/redis.conf.d/auth.conf ]; then
     PASS=$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 40)
