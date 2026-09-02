@@ -199,6 +199,54 @@ def tune(model, db: str, images: str, batch_size: int, target_precision: float,
     return {"thresholds": out, "notes": notes, "target_precision": target_precision}
 
 
+def confirm_on_test(t: dict, before: dict, after: dict,
+                    target_precision: float) -> tuple[dict, dict]:
+    """Keep only the tuned thresholds whose gain survives the test split.
+
+    tune() fits on val, which is the right split to fit on -- but with val
+    supports in the single digits, "lowest threshold meeting a precision target"
+    fits noise as readily as signal, and a threshold written from that goes
+    straight into the live labeller.
+
+    A threshold is only worth writing if, measured on held-out test, it actually
+    BUYS recall and still holds the precision it was fitted to reach. Both
+    numbers are already computed for the summary table; this just refuses to
+    write the ones that fail.
+
+    Observed 2026-09-02 on the 12-class checkpoint: of six proposed thresholds
+    this keeps one. twitter's 0.97 cost 0.29 recall on the highest-volume class
+    and landed at 0.94 test precision -- below the 0.95 it was fitted for.
+    facebook's 0.29 showed val precision 1.00 and test precision 0.50.
+    """
+    kept: dict[str, float] = {}
+    dropped: dict[str, str] = {}
+    for name, thr in t["thresholds"].items():
+        b = before["per_class"].get(name)
+        a = after["per_class"].get(name)
+        if not b or not a or b["ap"] is None or a["ap"] is None:
+            dropped[name] = "not measurable on test"
+        elif a["recall"] <= b["recall"] + 1e-9:
+            dropped[name] = (f"no recall gain on test "
+                             f"({b['recall']:.2f} -> {a['recall']:.2f})")
+        elif a["precision"] < target_precision:
+            dropped[name] = (f"test precision {a['precision']:.2f} < target "
+                             f"{target_precision:.2f}")
+        else:
+            kept[name] = thr
+    return kept, dropped
+
+
+def show_confirmation(kept: dict, dropped: dict) -> None:
+    print(f"\nconfirmed against the test split: keeping {len(kept)} of "
+          f"{len(kept) + len(dropped)} proposed")
+    for name, thr in sorted(kept.items()):
+        print(f"  keep  {name:<13}{thr:.2f}")
+    for name, why in sorted(dropped.items()):
+        print(f"  drop  {name:<13}{why}")
+    if not kept:
+        print("  nothing survived -- every class stays at the global threshold")
+
+
 def show_tuning(t: dict, before: dict, after: dict) -> None:
     print(f"\ntuned on the val split for >= {t['target_precision']:.0%} precision")
     print(f"\n  {'class':<13}{'thr':>6}{'test recall':>14}{'test prec':>11}   note")
@@ -300,15 +348,21 @@ def main() -> None:
         after = score(model, args.db, args.images, "test", args.batch_size,
                       thresholds=t["thresholds"])
         show_tuning(t, before, after)
+        kept, dropped = confirm_on_test(t, before, after, args.target_precision)
+        show_confirmation(kept, dropped)
         if args.write_constants:
             body = "\n".join(f'    "{k}": {v:.2f},'
-                              for k, v in sorted(t["thresholds"].items()))
+                              for k, v in sorted(kept.items()))
+            note = "".join(f"#   {n}: {w}\n" for n, w in sorted(dropped.items()))
             Path(args.write_constants).write_text(
                 "# Fitted by evaluate.py --tune-thresholds on the val split,\n"
-                f"# for >= {args.target_precision:.0%} precision per class.\n"
+                f"# for >= {args.target_precision:.0%} precision per class, then\n"
+                "# confirmed against test -- a threshold is written only if it\n"
+                "# gains recall there AND holds its precision target.\n"
                 "# Classes absent here fall back to THRESHOLD.\n"
-                f"CLASS_THRESHOLDS = {{\n{body}\n}}\n")
-            print(f"\nwrote {args.write_constants}")
+                + (f"#\n# Proposed on val but dropped on test:\n{note}" if dropped else "")
+                + f"CLASS_THRESHOLDS = {{\n{body}\n}}\n")
+            print(f"\nwrote {args.write_constants} ({len(kept)} thresholds)")
         if args.json:
             Path(args.json).write_text(json.dumps(
                 {"tuning": t, "test_before": before, "test_after": after}, indent=2) + "\n")
