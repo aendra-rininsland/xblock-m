@@ -49,10 +49,37 @@ def main() -> None:
                    help="actually publish -- this replaces what the live worker loads")
     args = p.parse_args()
 
+    # Check write access first. Publishing fails at the very end otherwise, with
+    # a 403 from repos/create that reads like the repo is missing rather than
+    # like the token is read-scoped.
+    if args.yes:
+        from huggingface_hub import HfApi
+        try:
+            me = HfApi().whoami()
+        except Exception as e:
+            sys.exit(f"not logged in to Hugging Face: {e}\n"
+                     "  huggingface-cli login")
+        at = (me.get("auth", {}) or {}).get("accessToken", {}) or {}
+        role = at.get("role")
+        # A fine-grained token reports role='fineGrained' and carries its real
+        # permissions nested, so the role alone says nothing about write access.
+        perms = set()
+        fg = at.get("fineGrained") or {}
+        for scope in list(fg.get("scoped") or []) + [{"permissions": fg.get("global") or []}]:
+            perms.update(scope.get("permissions") or [])
+        can_write = role == "write" or any("write" in p for p in perms)
+        if not can_write:
+            sys.exit(
+                f"logged in as {me.get('name')}, token role '{role}' -- no write "
+                f"permission found.\n"
+                "  Create a token at https://huggingface.co/settings/tokens with write\n"
+                "  access, then: huggingface-cli login")
+        print(f"authenticated as {me.get('name')} (role: {role}"
+              + (f", perms: {', '.join(sorted(perms))}" if perms else "") + ")")
+
     import torch  # noqa: F401
     from safetensors.torch import load_file
     from timm import create_model
-    from timm.models import push_to_hf_hub
 
     path = Path(args.weights)
     f = path / "model.safetensors" if path.is_dir() else path
@@ -124,10 +151,33 @@ def main() -> None:
                 f"{metrics['fp_rate_on_negatives']*100:.2f}%.\n\n"
                 f"| class | n | AP | precision | recall |\n|---|---|---|---|---|\n{rows}\n"}
 
-    push_to_hf_hub(model, args.repo,
-                   model_config=dict(label_names=list(CLASSES)),
-                   **({"model_card": card} if card else {}))
-    print(f"\npublished to howdyaendra/{args.repo}")
+    from huggingface_hub import HfApi
+    from timm.models._hub import save_for_hf
+
+    api = HfApi()
+    repo_id = f"{api.whoami()['name']}/{args.repo}"
+
+    # push_to_hf_hub calls create_repo(exist_ok=True) unconditionally, which a
+    # fine-grained token without repo-creation rights rejects with a 403 -- even
+    # when the repo already exists and the token can write to it. Only create
+    # when it is genuinely missing.
+    if api.repo_exists(repo_id):
+        print(f"repo exists, uploading without create")
+    else:
+        print(f"repo does not exist, creating it")
+        api.create_repo(repo_id, exist_ok=True)
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        save_for_hf(model, tmp, model_config=dict(label_names=list(CLASSES)),
+                    safe_serialization=True)
+        if card:
+            (Path(tmp) / "README.md").write_text(card["description"])
+        api.upload_folder(repo_id=repo_id, folder_path=tmp,
+                          commit_message=f"xblock model, macro AP "
+                                         f"{metrics['macro_ap']:.3f}" if metrics
+                                         else "xblock model")
+    print(f"\npublished to {repo_id}")
     print("Restart the worker to pick it up:")
     print("  supervisorctl -c /home/aendra/xblock-docker/supervisord.conf "
           "restart xblock-worker")
