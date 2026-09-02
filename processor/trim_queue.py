@@ -35,8 +35,17 @@ import sys
 import time
 
 import redis
+from dotenv import load_dotenv
 
 from constants import MAX_JOB_AGE_HOURS
+
+# worker.py does this and this file did not, so REDIS_CONNECTION_STRING was only
+# ever visible if it happened to be exported -- and under supervisord it is not.
+# The result was a program that exited immediately with "set
+# REDIS_CONNECTION_STRING", every time, which is why the age bound has never
+# actually been enforced. The connection string carries a password now, so it
+# belongs in processor/.env rather than in the tracked supervisord.conf.
+load_dotenv()
 
 BATCH = 500
 

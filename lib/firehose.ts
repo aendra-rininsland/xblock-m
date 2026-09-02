@@ -11,12 +11,20 @@ import Redis from "ioredis";
 
 const REDIS_HOST = process.env.REDIS_HOSTNAME ?? "redis";
 
+// Undefined when unset, which ioredis treats as "no auth" -- so this stays
+// compatible with a Redis that has no requirepass. The migrated queue box does
+// set one: Redis there binds to loopback and WireGuard only and 6379 is
+// firewalled, but the old box's public 6379 behind an IP allowlist is exactly
+// the arrangement that quietly stopped working whenever the home IP changed,
+// so the password is the belt to the tunnel's braces.
+const REDIS_PASSWORD = process.env.REDIS_PASSWORD || undefined;
+
 export const queue = new Queue("xblock", {
-  connection: { host: REDIS_HOST },
+  connection: { host: REDIS_HOST, password: REDIS_PASSWORD },
 });
 
 // Separate low-traffic client used only for heartbeat writes.
-const redis = new Redis({ host: REDIS_HOST, lazyConnect: true });
+const redis = new Redis({ host: REDIS_HOST, password: REDIS_PASSWORD, lazyConnect: true });
 redis.on("error", (e) => console.error("[firehose] redis error:", e));
 
 const log = debug("xblock:firehose");
