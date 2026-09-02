@@ -12,6 +12,15 @@ labels are reaching the network -- rather than that a process is running. A
 worker that is up but silently emitting nothing looks healthy to a process
 monitor and dead to this.
 
+This does NOT replace processor/watchdog.py, which already pings healthchecks.io
+via HEALTHCHECKS_URL in processor/.env. That one watches the infrastructure --
+worker process alive, jobs being consumed, firehose heartbeat fresh -- and all
+of those can be green while zero labels reach the network. The two are
+complementary, so give this its own check UUID: folding them into one check
+would let an infrastructure ping mask a labelling outage.
+
+Reads LABEL_HEALTHCHECKS_URL from processor/.env, following the same convention.
+
 Two conditions, because there are two failure modes worth separating:
 
   rate     labels/hour across the window. Catches the whole pipeline stopping:
@@ -40,10 +49,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import os
 import re
 import sys
 import time
 import urllib.request
+from pathlib import Path
 
 STREAM = "wss://xblock.aendra.dev/xrpc/com.atproto.label.subscribeLabels"
 
@@ -114,8 +125,23 @@ def main() -> None:
                         "total stop; raise to 2-3 only with a longer window, "
                         "since a quiet hour can legitimately be twitter-only")
     p.add_argument("--ping-url", default=None,
-                   help="Healthchecks.io or Uptime Kuma push URL")
+                   help="Healthchecks.io or Uptime Kuma push URL. Defaults to "
+                        "LABEL_HEALTHCHECKS_URL from the environment or "
+                        "processor/.env. Must be a DIFFERENT check from the "
+                        "HEALTHCHECKS_URL that processor/watchdog.py uses.")
     args = p.parse_args()
+
+    if not args.ping_url:
+        args.ping_url = os.getenv("LABEL_HEALTHCHECKS_URL") or None
+    if not args.ping_url:
+        # Same file processor/watchdog.py loads, so one place holds the config.
+        env = Path(__file__).resolve().parent.parent / "processor" / ".env"
+        if env.is_file():
+            for line in env.read_text(errors="replace").splitlines():
+                key, _, value = line.partition("=")
+                if key.strip() == "LABEL_HEALTHCHECKS_URL":
+                    args.ping_url = value.strip().strip("'\"") or None
+                    break
 
     counts, connected = asyncio.run(sample(args.url, args.window))
     total = sum(counts.values())

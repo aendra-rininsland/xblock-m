@@ -45,9 +45,38 @@ expires after 48 hours by design — so it is the cheap place to get the pattern
 wrong. Ozone second: it is stateful, public, and carries the labeller's
 identity.
 
+### Hetzner gotchas
+
+Learned by hitting all of them on 2 September 2026. The API's errors point at
+the wrong field in every case.
+
+**CAX (Ampere) is EU-only** — `nbg1` and `hel1`. Not `fsn1` (supported but shown
+unavailable), and not offered in Ashburn or Hillsboro at all. An ARM plan
+therefore cannot be placed in the US; a US deployment means the x86 CX/CPX line.
+
+**`ubuntu-24.04` is two different images.** One x86 (`161547269`), one arm
+(`161547270`), same name. Resolving by name yields the x86 image, and the
+resulting architecture mismatch is reported as *"unsupported location for server
+type"* — which sends you looking at the location for a long time. Pass the arm
+image ID.
+
+**`datacenter` is gone.** Deprecated 2025-12-16; only `location` is accepted
+now. Passing a datacenter returns a clear error, unlike the two above.
+
+**Prices are higher than commonly quoted:** CAX11 €5.99/mo and CAX21 €10.49/mo
+(net = gross), plus €0.50 per primary IPv4. Both include 20 TB of traffic.
+
+**A new account cannot create servers until it is verified.** Every
+`(type, location)` pair returns *"unsupported location for server type"*, x86
+included, while free resources like placement groups create fine. That
+combination means the token and write access are good and compute is gated —
+not that the request is wrong. Clearing it needs the account owner and Hetzner
+support, not a code change.
+
 ### Phase 1 — queue box
 
-1. Create CAX11, Ubuntu 24.04, `fsn1`, with `cloud-init-queue.yaml` as user data.
+1. Create CAX11, Ubuntu 24.04, **`nbg1`** (not `fsn1` — see above), with
+   `cloud-init-queue.yaml` as user data.
 2. `scp setup-queue.sh` across and run it with sudo.
 3. Copy the generated Redis password out of `/root/redis-password.txt`, then delete it.
 4. Add Love as a peer, or use the SSH tunnel (below).
