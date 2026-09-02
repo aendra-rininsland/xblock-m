@@ -1,0 +1,103 @@
+#cloud-config
+# Queue box (CAX11, arm64, Ubuntu 24.04) -- Redis + the firehose consumer.
+#
+# Deliberately minimal. This does base hardening and package install only; the
+# application setup lives in setup-queue.sh so it can be re-run and iterated on
+# without destroying and re-provisioning the server.
+#
+# Usage (Hetzner console "Cloud config" field, or):
+#   hcloud server create --name xblock-queue --type cax11 --image ubuntu-24.04 \
+#     --location fsn1 --ssh-key xblock-migration --user-data-from-file \
+#     infra/cloud-init-queue.yaml
+
+hostname: xblock-queue
+timezone: Etc/UTC
+
+users:
+  - name: xblock
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    ssh_authorized_keys:
+      # Love's migration key. Replace if you rotate it.
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ71N05nNen+OjDWUEPwD3n6NErdeBOkmKGk6fx7VJT2 xblock-migration-2026-09
+
+package_update: true
+package_upgrade: true
+packages:
+  - redis-server
+  - wireguard
+  - ufw
+  - git
+  - curl
+  - jq
+  - unattended-upgrades
+  - fail2ban
+
+write_files:
+  # Redis is never exposed publicly. It listens on loopback and on the
+  # WireGuard interface only; the worker on Love reaches it through the tunnel.
+  # This replaces the security-group IP allowlist, which silently goes stale
+  # whenever the home IP changes.
+  - path: /etc/redis/redis.conf.d/xblock.conf
+    permissions: "0640"
+    content: |
+      # The "-" prefix makes the bind OPTIONAL. 10.10.0.1 is the WireGuard
+      # address, which only exists once wg-quick@wg0 is up -- so without it,
+      # redis loses the boot race against WireGuard and exits 1. systemd does
+      # retry and it comes up on the second attempt, which hides the problem
+      # while leaving every reboot a coin flip. This makes it deterministic.
+      bind 127.0.0.1 -10.10.0.1
+      protected-mode yes
+      port 6379
+
+      # 4 GB box. Observed peak on the old instance was 2.05 GB, so this is a
+      # backstop against the OOM killer taking the whole box, not a tuning knob.
+      #
+      # NOTE the design tension, documented in processor/constants.py: a memory
+      # cap behaves as a depth cap, and a depth cap discards the NEWEST work
+      # during a burst, which is the opposite of what the LIFO design wants.
+      # The intended mechanism is the 48h age bound (MAX_JOB_AGE_HOURS), which
+      # keeps the queue bounded on its own. If this limit is ever actually hit,
+      # move to a CAX21 rather than tuning this number down.
+      maxmemory 2560mb
+      maxmemory-policy noeviction
+
+      # The queue is reconstructible -- every job expires after 48h and the
+      # firehose replays. Persistence buys little and costs fsync latency.
+      save ""
+      appendonly no
+
+  - path: /etc/ufw/applications.d/wireguard
+    content: |
+      [wireguard]
+      title=WireGuard
+      description=WireGuard VPN
+      ports=51820/udp
+
+runcmd:
+  # Default deny inbound. Only SSH and WireGuard are reachable from the
+  # internet; Redis is not, and never should be.
+  - ufw --force reset
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow OpenSSH
+  - ufw allow 51820/udp comment 'WireGuard'
+  - ufw --force enable
+
+  # Redis on Ubuntu does not read a conf.d directory by default, and `include`
+  # takes ONE path with no glob expansion -- so each file needs its own line.
+  # setup-queue.sh/bootstrap-queue.sh add auth.conf; without its own include
+  # the generated requirepass is never applied and redis answers unauthenticated.
+  - sh -c 'grep -q "redis.conf.d/xblock.conf" /etc/redis/redis.conf || echo "include /etc/redis/redis.conf.d/xblock.conf" >> /etc/redis/redis.conf'
+  - systemctl enable --now redis-server
+
+  - systemctl enable --now fail2ban
+  # Use the list form for anything containing ": ". As a bare YAML scalar, a
+  # colon-space turns the entry into a mapping, cloud-init's shellify() rejects
+  # the dict, and the WHOLE runcmd block aborts before running a single command
+  # -- so ufw and redis silently never start while the packages install fine.
+  # That failure looked like a Hetzner problem and was not.
+  - ["sh", "-c", "echo \"queue box base provision complete: $(date -u)\" > /var/log/xblock-provision.log"]
+
+final_message: "xblock-queue base ready after $UPTIME s. Run setup-queue.sh next."
