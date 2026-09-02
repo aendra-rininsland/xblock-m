@@ -7,6 +7,8 @@ import { ExpressAdapter } from "@bull-board/express";
 const queueMQ = new Queue("xblock", {
   connection: {
     host: process.env.REDIS_HOSTNAME ?? "redis",
+    // undefined when unset, so a Redis without requirepass still works
+    password: process.env.REDIS_PASSWORD || undefined,
   },
 });
 
