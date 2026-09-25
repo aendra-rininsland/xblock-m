@@ -244,6 +244,11 @@ async def _batch_loop() -> None:
             # process_single_image can catch it and return an error result.
             _fail_waiters(items, RuntimeError("inference batcher stopped"))
             raise
+        except torch.cuda.CudaError as e:
+            # CUDA context corruption is unrecoverable — crash so supervisord restarts.
+            logger.critical("Unrecoverable CUDA error, exiting for supervisord restart: %s", e)
+            _fail_waiters(items, e)
+            raise SystemExit(1)
         except Exception as e:
             logger.error("Batch inference failed (n=%d): %s", len(items), e)
             _fail_waiters(items, e)
@@ -324,6 +329,9 @@ async def process_single_image(image_url: str, cid: str, top_k: int = 10) -> dic
             "labels": dict(label_prob_pairs[:top_k]),
             "time": time.time() - start_time,
         }
+    except torch.cuda.CudaError as e:
+        logger.critical("Unrecoverable CUDA error, exiting for supervisord restart: %s", e)
+        raise SystemExit(1)
     except Exception as e:
         logger.error("Image inference failed for %s: %s", image_url, e)
         return {"error": str(e), "url": image_url, "blob_cid": cid, "labels": {}}
