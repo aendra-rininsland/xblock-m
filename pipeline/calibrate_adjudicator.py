@@ -161,6 +161,7 @@ def main() -> None:
     confusion: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
     conf_right: dict[str, list[float]] = collections.defaultdict(list)
     conf_wrong: dict[str, list[float]] = collections.defaultdict(list)
+    kinds: collections.Counter = collections.Counter()
     failures: list[dict] = []
     records: list[dict] = []
     started = time.time()
@@ -179,19 +180,39 @@ def main() -> None:
         # The corpus calls a non-platform image 'negative'; the adjudicator
         # distinguishes 'uncategorised' from 'not-a-screenshot'. Both mean "no
         # platform label", so both count as agreeing with 'negative'.
-        # Agreement = the prediction is among the labels this image carries.
-        # 'negative' in the corpus means "no platform"; the adjudicator splits
-        # that into 'uncategorised' and 'not-a-screenshot', so both count.
-        predicted = j.platform
-        agreed = predicted in truth_set or (
-            "negative" in truth_set and predicted in ("uncategorised", "not-a-screenshot"))
+        # Both sides are sets now. The corpus says 'negative' for "no
+        # platform"; the adjudicator expresses that as an empty platform list
+        # with a nature of other-screenshot or not-a-screenshot.
+        predicted_set = j.platform_names
+        truth_platforms = truth_set - {"negative"}
+
+        if not truth_platforms:                      # corpus says no platform
+            agreed = not predicted_set
+            overlap_kind = "exact" if agreed else "miss"
+        elif not predicted_set:                      # adjudicator says none
+            agreed = False
+            overlap_kind = "miss"
+        else:
+            shared = predicted_set & truth_platforms
+            agreed = bool(shared)
+            overlap_kind = ("exact" if predicted_set == truth_platforms
+                            else "partial" if shared else "miss")
+
+        predicted = "+".join(sorted(predicted_set)) or f"none/{j.nature}"
 
         confusion[truth][predicted] += 1
-        (conf_right if agreed else conf_wrong)[truth].append(j.confidence)
+        (conf_right if agreed else conf_wrong)[truth].append(j.top_confidence)
+        kinds[overlap_kind] += 1
         records.append({"cid": cid, "truth": truth,
-                        "truth_labels": sorted(truth_set), "predicted": predicted,
-                        "confidence": j.confidence, "agreed": agreed,
-                        "evidence": j.evidence})
+                        "truth_labels": sorted(truth_set),
+                        "predicted": predicted,
+                        "predicted_set": sorted(predicted_set),
+                        "nature": j.nature,
+                        "overlap": overlap_kind,
+                        "confidence": j.top_confidence, "agreed": agreed,
+                        "evidence": " | ".join(
+                            f"{c.platform}: {c.evidence}" for c in j.platforms
+                        ) or f"(no platform; {j.nature})"})
 
         if n % 20 == 0:
             ok = sum(1 for r in records if r["agreed"])
@@ -200,6 +221,11 @@ def main() -> None:
 
     print()
     elapsed = time.time() - started
+
+    print(f"\n=== set overlap: exact {kinds['exact']}  partial {kinds['partial']}  "
+          f"miss {kinds['miss']} ===")
+    print("  partial = overlapping but not identical, usually a nested platform"
+          "\n            the corpus did not record. Only `miss` is a real failure.")
 
     print(f"\n=== agreement with human labels ({len(records)} scored, "
           f"{len(failures)} failed, {elapsed:.0f}s) ===")

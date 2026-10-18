@@ -73,38 +73,74 @@ MODEL = os.getenv("ADJUDICATOR_MODEL", "claude-sonnet-5-5")
 EFFORT = os.getenv("ADJUDICATOR_EFFORT", "low")
 
 
-class Judgement(BaseModel):
-    """What the adjudicator returns. Deliberately small and closed."""
+class PlatformCall(BaseModel):
+    """One platform the adjudicator sees in the image, with its own confidence."""
 
-    platform: Platform = Field(
-        description="Which platform's interface this screenshot shows. "
-                    "'uncategorised' if it is a screenshot but not of a social "
-                    "platform. 'not-a-screenshot' if it is a photo, meme, "
-                    "artwork or anything that is not a screen capture."
-    )
+    platform: Platform = Field(description="A platform whose interface is visible.")
     confidence: float = Field(
         ge=0.0, le=1.0,
-        description="How confident you are, 0 to 1. Be honest: a low number "
-                    "here routes the case to a human, which is the correct "
-                    "outcome when the image is ambiguous, cropped or unclear."
+        description="How confident you are that THIS platform is present, 0 to 1. "
+                    "Be honest: a low number routes the case to a human, which is "
+                    "the right outcome for a cropped or ambiguous image."
     )
     evidence: str = Field(
-        max_length=300,
-        description="One sentence naming what IN THE IMAGE decided it -- the "
-                    "specific interface elements you can see. Not a restatement "
-                    "of the answer."
-    )
-    applied_labels_correct: Optional[bool] = Field(
-        default=None,
-        description="Whether the labels already applied to this image are "
-                    "right. Null if no labels were supplied."
+        # 300 was too tight and cost 7 of 193 calls on the first calibration
+        # run -- the model writes good specific evidence and then fails
+        # validation on length, so a usable judgement is paid for and thrown
+        # away. The cap exists to keep an essay out of the Ozone comment field,
+        # not to police the sentence; truncate at the write site if needed.
+        max_length=600,
+        description="What IN THE IMAGE shows this platform -- the specific "
+                    "interface elements you can see. Not a restatement."
     )
 
 
-SYSTEM = """You identify which social media platform a screenshot came from.
+class Judgement(BaseModel):
+    """What the adjudicator returns.
+
+    `platforms` is a LIST because the classifier is multi-label: a sigmoid head
+    with BCEWithLogitsLoss, where every class is thresholded independently. An
+    image genuinely can be two platforms at once, and nested content is common
+    in this queue -- a tweet screenshotted inside Instagram, a Mastodon post
+    unfurled in Discord, a 4chan grab quoted in a Truth Social post.
+
+    An earlier version of this returned a single platform. That did not just
+    lose information, it MANUFACTURED errors: on the first calibration run two
+    of the eight high-confidence "mistakes" were cases where the right answer
+    was both labels and the schema allowed only one. Forcing a single answer on
+    a multi-label problem makes the adjudicator wrong by construction.
+    """
+
+    platforms: list[PlatformCall] = Field(
+        default_factory=list,
+        description="Every platform whose interface is visible, each with its "
+                    "own confidence. Usually one. Give TWO when the image shows "
+                    "one platform's content inside another's interface -- list "
+                    "both, the outer interface and the inner content. Leave "
+                    "EMPTY if no listed platform is present."
+    )
+    nature: Literal["platform-screenshot", "other-screenshot", "not-a-screenshot"] = Field(
+        description="'platform-screenshot' if at least one listed platform is "
+                    "visible. 'other-screenshot' if it is a screenshot but of "
+                    "something else (a game, a news site, a forum, a terminal). "
+                    "'not-a-screenshot' for a photo, meme, drawing or anything "
+                    "not captured from a screen."
+    )
+
+    @property
+    def platform_names(self) -> set[str]:
+        return {p.platform for p in self.platforms}
+
+    @property
+    def top_confidence(self) -> float:
+        """Confidence in the strongest call, or in 'no platform' when empty."""
+        return max((p.confidence for p in self.platforms), default=1.0)
+
+
+SYSTEM = """You identify which social media platforms a screenshot shows.
 
 You are a second opinion. An image classifier has already labelled this image \
-and a human has disputed it, so the prior that something is wrong here is much \
+and a human has disputed it, so the prior that something is wrong is much \
 higher than usual. Judge the image on what you can actually see.
 
 Decide from interface evidence: the shape and position of the compose box, the \
@@ -112,17 +148,31 @@ action row (reply / repost / like / share) and its icons, the handle and \
 username format, timestamp style, navigation chrome, colour scheme, and any \
 visible branding. Name that evidence specifically.
 
+MORE THAN ONE PLATFORM CAN BE PRESENT, and in this queue it often is. \
+Screenshots of screenshots are everywhere: a tweet posted to Instagram, a \
+Mastodon post unfurled in a Discord embed, a forum post quoting a Truth Social \
+screenshot. When one platform's content appears inside another's interface, \
+LIST BOTH -- the outer interface you are looking at, and the inner content \
+being shown. Do not pick one and discard the other.
+
+A domain-style handle (@user@server.tld) together with a public-visibility \
+globe icon is the fediverse (Mastodon and compatible), even when the post has \
+been bridged and is being viewed elsewhere. Judge by the interface conventions \
+in the image.
+
 Platform interfaces change. Judge by what the interface looks like in the \
 image, not by what the platform used to look like.
 
-Return 'uncategorised' for a screenshot that is not of a social platform -- a \
-game, a news site, a messaging app, a terminal. Return 'not-a-screenshot' for \
-a photo, meme, drawing or anything not captured from a screen.
+Set nature to 'other-screenshot' for a screenshot of something that is not a \
+listed platform -- a game, a news site, a forum, a terminal -- and leave the \
+platform list empty unless a listed platform also appears inside it. Use \
+'not-a-screenshot' for a photo, drawing or meme that was never a screen \
+capture.
 
-Be honest about confidence. A heavily cropped image, a screenshot of a \
+Be honest about confidence, per platform. A heavy crop, a screenshot of a \
 screenshot, or an interface you genuinely cannot place should get a low number. \
 Low confidence sends the case to a human, which is the right outcome; a \
-confident wrong answer is acted on automatically."""
+confident wrong answer gets acted on automatically."""
 
 
 def _image_block(path: Path) -> dict:
@@ -218,10 +268,16 @@ def adjudicate(client, image_path: str | Path, *,
     if judgement is None:
         raise ValueError("adjudicator returned no parsable judgement")
 
-    # Belt and braces. Pydantic's Literal already constrains this, but the
+    # Belt and braces. Pydantic's Literal already constrains these, but the
     # closed-set check is the thing standing between report text and the action
-    # space, so it is asserted here rather than assumed.
-    if judgement.platform not in PLATFORMS:
-        raise ValueError(f"adjudicator returned off-schema platform: {judgement.platform!r}")
+    # space, so it is asserted rather than assumed.
+    for call in judgement.platforms:
+        if call.platform not in PLATFORMS:
+            raise ValueError(f"adjudicator returned off-schema platform: {call.platform!r}")
+
+    # A platform listed twice would double-count in any downstream set logic.
+    names = [c.platform for c in judgement.platforms]
+    if len(names) != len(set(names)):
+        raise ValueError(f"adjudicator repeated a platform: {names}")
 
     return judgement
